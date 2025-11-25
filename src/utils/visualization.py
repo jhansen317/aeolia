@@ -6,6 +6,9 @@ from pathlib import Path
 import networkx as nx
 from mpl_toolkits.mplot3d import Axes3D
 
+# Import threshold from metrics module
+from src.training.metrics import NOTE_THRESHOLD
+
 
 def visualize_predictions(inputs, targets, filenames, metrics_list=None, save_path=None, max_samples=10):
     """
@@ -82,7 +85,7 @@ def visualize_predictions(inputs, targets, filenames, metrics_list=None, save_pa
 
         # Remove nodes that are inactive for the entire sequence
         # A node is active if it has any value > threshold in either target or input
-        active_mask = (target_roll.max(axis=1) > 0.01) | (input_roll.max(axis=1) > 0.01)
+        active_mask = (target_roll.max(axis=1) > NOTE_THRESHOLD) | (input_roll.max(axis=1) > NOTE_THRESHOLD)
 
         if active_mask.sum() > 0:
             target_roll = target_roll[active_mask]
@@ -95,8 +98,8 @@ def visualize_predictions(inputs, targets, filenames, metrics_list=None, save_pa
         # - Blue = false negatives (in target but not predicted)
         # - Black = true negatives (silence)
 
-        target_bin = (target_roll > 0.5)
-        input_bin = (input_roll > 0.5)
+        target_bin = (target_roll > NOTE_THRESHOLD)
+        input_bin = (input_roll > NOTE_THRESHOLD)
 
         rgb_image = np.zeros((*target_roll.shape, 3))
 
@@ -156,18 +159,21 @@ def visualize_predictions(inputs, targets, filenames, metrics_list=None, save_pa
         plt.show()
 
 
-def visualize_activations(activations_dict, inputs_dict, num_layers, save_path=None):
+def visualize_activations(activations_dict, inputs_dict, num_layers, model_input=None, model_output=None, save_path=None):
     """
     Visualize all intermediate activations from model layers in a single figure.
     Picks one random example from the batch.
-    Stacks all activations vertically with uniform width.
+    Shows: input -> encoder layers -> decoder layers -> output
+    For hidden layers, shows node-level energy (mean of squared features).
 
     Args:
         activations_dict: Dictionary with keys like 'encoderlayer0', 'decoderlayer0', etc.
                          containing activation tensors
         inputs_dict: Dictionary with keys like 'encoderlayer0', 'decoderlayer0', etc.
-                    containing input tensors
+                    containing input tensors (not used, kept for compatibility)
         num_layers: Number of layers to visualize
+        model_input: Original input to the model (shape: batch, nodes, features, time)
+        model_output: Final output from the model after exp() (shape: batch, nodes, time)
         save_path: Optional path to save the visualization
     """
     # Pick one random example index (consistent across all layers)
@@ -175,18 +181,26 @@ def visualize_activations(activations_dict, inputs_dict, num_layers, save_path=N
 
     # Collect all layer data
     all_layer_data = []
-    for layer in range(num_layers):
-        layer_items = [
-            ('Encoder Input', inputs_dict.get(f'encoderlayer{layer}')),
-            ('Encoder Output', activations_dict.get(f'encoderlayer{layer}')),
-            ('Decoder Input', inputs_dict.get(f'decoderlayer{layer}')),
-            ('Decoder Output', activations_dict.get(f'decoderlayer{layer}'))
-        ]
-        all_layer_data.extend(layer_items)
 
-    # Filter out None data
-    valid_data = [(name, data) for name, data in all_layer_data if data is not None]
-    num_plots = len(valid_data)
+    # Add model input at the top if provided
+    if model_input is not None:
+        all_layer_data.append(('Input', model_input, True))  # True = is input/output
+
+    # Add encoder and decoder layers
+    for layer in range(num_layers):
+        encoder_act = activations_dict.get(f'encoderlayer{layer}')
+        if encoder_act is not None:
+            all_layer_data.append((f'Encoder {layer}', encoder_act, False))
+
+        decoder_act = activations_dict.get(f'decoderlayer{layer}')
+        if decoder_act is not None:
+            all_layer_data.append((f'Decoder {layer}', decoder_act, False))
+
+    # Add model output at the bottom if provided
+    if model_output is not None:
+        all_layer_data.append(('Output', model_output, True))  # True = is input/output
+
+    num_plots = len(all_layer_data)
 
     if num_plots == 0:
         print("No activation data to visualize")
@@ -197,7 +211,7 @@ def visualize_activations(activations_dict, inputs_dict, num_layers, save_path=N
     if num_plots == 1:
         axes = [axes]
 
-    for idx, (name, data) in enumerate(valid_data):
+    for idx, (name, data, is_input_output) in enumerate(all_layer_data):
         ax = axes[idx]
 
         # Convert to CPU and numpy
@@ -213,16 +227,26 @@ def visualize_activations(activations_dict, inputs_dict, num_layers, save_path=N
         if data.ndim >= 1:
             data = data[random_idx]
 
-        # Reshape to 2D for visualization
-        if data.ndim == 3:
-            dim1, dim2, dim3 = data.shape
-            data_2d = data.reshape(dim1 * dim2, dim3).numpy()
-        elif data.ndim == 2:
-            data_2d = data.numpy()
-        elif data.ndim == 1:
-            data_2d = data.unsqueeze(0).numpy()
+        # Process data based on whether it's input/output or hidden layer
+        if is_input_output:
+            # For input/output: show as [nodes, time]
+            if data.ndim == 3:
+                # Input: [nodes, features, time] -> take mean over features
+                data_2d = data.mean(dim=1).numpy()
+            elif data.ndim == 2:
+                # Output: [nodes, time]
+                data_2d = data.numpy()
+            else:
+                data_2d = data.unsqueeze(0).numpy()
         else:
-            data_2d = data.reshape(-1, data.shape[-1]).numpy()
+            # For hidden layers: compute node-level energy as mean(activations^2)
+            if data.ndim == 3:
+                # [nodes, features, time] -> [nodes, time]
+                data_2d = (data ** 2).mean(dim=1).numpy()
+            elif data.ndim == 2:
+                data_2d = data.numpy()
+            else:
+                data_2d = data.unsqueeze(0).numpy()
 
         # Plot without any labels or ticks
         ax.imshow(data_2d, aspect='auto', origin='lower', cmap='viridis', interpolation='nearest')

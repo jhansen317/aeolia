@@ -8,6 +8,9 @@ against ground truth targets.
 import torch
 import torch.nn.functional as F
 
+# Global threshold for note on/off detection
+NOTE_THRESHOLD = 0.01
+
 
 class MusicGenerationMetrics:
     """
@@ -17,12 +20,12 @@ class MusicGenerationMetrics:
     and compares against count-based targets (e.g., velocities).
     """
 
-    def __init__(self, threshold=0.5):
+    def __init__(self, threshold=None):
         """
         Args:
-            threshold: Velocity threshold for considering a note "on" (default: 0.5)
+            threshold: Velocity threshold for considering a note "on" (default: NOTE_THRESHOLD)
         """
-        self.threshold = threshold
+        self.threshold = threshold if threshold is not None else NOTE_THRESHOLD
 
     def __call__(self, predictions, targets, node_mask=None):
         """
@@ -67,14 +70,27 @@ class MusicGenerationMetrics:
         # Apply node mask if provided (exclude padding/unused nodes)
         if node_mask is not None:
             mask_expanded = node_mask.unsqueeze(-1).expand_as(pred_binary)
-            pred_binary = pred_binary * mask_expanded
-            target_binary = target_binary * mask_expanded
 
-        # Calculate true positives, false positives, false negatives, true negatives
-        tp = (pred_binary * target_binary).sum()
-        fp = (pred_binary * (1 - target_binary)).sum()
-        fn = ((1 - pred_binary) * target_binary).sum()
-        tn = ((1 - pred_binary) * (1 - target_binary)).sum()
+            # Calculate true positives, false positives, false negatives, true negatives
+            # Only on masked (active) nodes
+            tp = (pred_binary * target_binary * mask_expanded).sum()
+            fp = (pred_binary * (1 - target_binary) * mask_expanded).sum()
+            fn = ((1 - pred_binary) * target_binary * mask_expanded).sum()
+            tn = ((1 - pred_binary) * (1 - target_binary) * mask_expanded).sum()
+
+            # Calculate MSE only on active nodes
+            pred_masked = predictions * mask_expanded
+            target_masked = targets * mask_expanded
+            mse = (pred_masked - target_masked).pow(2).sum() / mask_expanded.sum()
+        else:
+            # Calculate true positives, false positives, false negatives, true negatives
+            tp = (pred_binary * target_binary).sum()
+            fp = (pred_binary * (1 - target_binary)).sum()
+            fn = ((1 - pred_binary) * target_binary).sum()
+            tn = ((1 - pred_binary) * (1 - target_binary)).sum()
+
+            # Calculate MSE for continuous values
+            mse = F.mse_loss(predictions, targets)
 
         # Calculate metrics with small epsilon to avoid division by zero
         eps = 1e-8
@@ -82,9 +98,6 @@ class MusicGenerationMetrics:
         recall = tp / (tp + fn + eps)
         f1 = 2 * (precision * recall) / (precision + recall + eps)
         accuracy = (tp + tn) / (tp + tn + fp + fn + eps)
-
-        # Also calculate MSE for continuous values
-        mse = F.mse_loss(predictions, targets)
 
         return {
             'precision': precision.item(),
@@ -132,12 +145,14 @@ class NoteOnsetMetrics:
     it's predicted within a small time window of the actual onset.
     """
 
-    def __init__(self, tolerance_frames=1):
+    def __init__(self, tolerance_frames=1, threshold=None):
         """
         Args:
             tolerance_frames: Number of frames of tolerance for onset timing
+            threshold: Threshold for considering a note "on" (default: NOTE_THRESHOLD)
         """
         self.tolerance = tolerance_frames
+        self.threshold = threshold if threshold is not None else NOTE_THRESHOLD
 
     def __call__(self, predictions, targets, node_mask=None):
         """
@@ -152,15 +167,21 @@ class NoteOnsetMetrics:
             dict: onset_precision, onset_recall, onset_f1
         """
         # Convert to binary
-        pred_binary = (predictions > 0.5).float()
-        target_binary = (targets > 0.5).float()
+        pred_binary = (predictions > self.threshold).float()
+        target_binary = (targets > self.threshold).float()
 
         # Detect onsets (transitions from 0 to 1)
         pred_onsets = self._detect_onsets(pred_binary)
         target_onsets = self._detect_onsets(target_binary)
 
+        # Apply node mask if provided
+        if node_mask is not None:
+            mask_expanded = node_mask.unsqueeze(-1).expand_as(pred_onsets)
+            pred_onsets = pred_onsets * mask_expanded
+            target_onsets = target_onsets * mask_expanded
+
         # Match onsets within tolerance
-        tp = self._count_matched_onsets(pred_onsets, target_onsets)
+        tp = self._count_matched_onsets(pred_onsets, target_onsets, node_mask)
         fp = pred_onsets.sum() - tp
         fn = target_onsets.sum() - tp
 
@@ -184,7 +205,7 @@ class NoteOnsetMetrics:
         onsets = binary_sequence * (1 - padded[:, :, :-1])
         return onsets
 
-    def _count_matched_onsets(self, pred_onsets, target_onsets):
+    def _count_matched_onsets(self, pred_onsets, target_onsets, node_mask=None):
         """Count how many predicted onsets match targets within tolerance."""
         # This is a simplified version - could be improved with proper onset matching
         # For now, just check if onsets align within tolerance window
@@ -193,6 +214,10 @@ class NoteOnsetMetrics:
         matched = 0
         for b in range(batch):
             for n in range(nodes):
+                # Skip masked (inactive) nodes
+                if node_mask is not None and not node_mask[b, n]:
+                    continue
+
                 pred_times = torch.where(pred_onsets[b, n] > 0)[0]
                 target_times = torch.where(target_onsets[b, n] > 0)[0]
 

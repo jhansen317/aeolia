@@ -54,8 +54,8 @@ class Trainer:
         self.device = device
         self.config = config
 
-        # Initialize metrics
-        self.metrics = MusicGenerationMetrics(threshold=0.5)
+        # Initialize metrics (using default NOTE_THRESHOLD)
+        self.metrics = MusicGenerationMetrics()
         self.onset_metrics = NoteOnsetMetrics(tolerance_frames=1)
         data_dir = project_root / "data" / "raw_test"
         self.checkpoint_dir = project_root / "checkpoints"
@@ -115,53 +115,68 @@ class Trainer:
                 print(f' loss: {loss}')
                 #example_loss += (kl_loss.mean()*0.001)
 
+                # Calculate and print metrics after every batch
+                if hasattr(data, 'file_paths') or 'file_paths' in data:
+                    try:
+                        targets = data.get('targets') if isinstance(data, dict) else data.targets
+                        targets = targets[:,:233, :]
+                        node_mask = data.get('node_mask') if isinstance(data, dict) else getattr(data, 'node_mask', None)
+                        node_mask = node_mask[:,:233]
+                        # Slice output to match targets and node_mask dimensions
+                        output_sliced = output[:,:233, :].exp()
+
+                        # Calculate all metrics (frame-level and onset-based)
+                        metrics_dict = self.metrics.calculate_metrics(output_sliced, targets, node_mask)
+                        onset_dict = self.onset_metrics(output_sliced, targets, node_mask)
+                        metrics_dict.update(onset_dict)
+
+                        print(f"Batch {example_idx} metrics: Acc={metrics_dict['note_accuracy']:.3f}, "
+                              f"Precision={metrics_dict['precision']:.3f}, Recall={metrics_dict['recall']:.3f}, "
+                              f"F1={metrics_dict['f1']:.3f}, MSE={metrics_dict['mse']:.4f}")
+                        print(f"  Onset: P={metrics_dict['onset_precision']:.3f}, R={metrics_dict['onset_recall']:.3f}, F1={metrics_dict['onset_f1']:.3f}")
+                    except Exception as e:
+                        print(f"Warning: Could not calculate metrics - {e}")
+
                 # Visualizations (every N examples to avoid overhead)
                 if (example_idx % 5) == 0:
                     # 1. Visualize all layer activations in one figure
+                    # Get model input and output
+                    model_input = data.get('features') if isinstance(data, dict) else getattr(data, 'features', None)
+                    model_output_probs = output[:,:233, :].exp()  # Convert to probs and slice to match
+
                     visualize_activations(
                         activations,
                         inputs,
                         self.model.num_layers,
+                        model_input=model_input,
+                        model_output=model_output_probs,
                         save_path=self.vis_dir / f"activations_epoch{epoch}_ex{example_idx}.png"
                     )
 
-                    # 2. Calculate metrics and visualize predictions
+                    # 2. Visualize predictions
                     if hasattr(data, 'file_paths') or 'file_paths' in data:
                         try:
                             file_paths = data.get('file_paths') if isinstance(data, dict) else data.file_paths
                             targets = data.get('targets') if isinstance(data, dict) else data.targets
+                            targets = targets[:,:233, :]
                             node_mask = data.get('node_mask') if isinstance(data, dict) else getattr(data, 'node_mask', None)
-
-                            # Calculate metrics using proper metrics module
-                            metrics_dict = self.metrics(output, targets, node_mask)
-
-                            # Also calculate onset metrics
-                            onset_dict = self.onset_metrics(output.exp(), targets, node_mask)
-                            metrics_dict.update(onset_dict)
+                            node_mask = node_mask[:,:233]
+                            # Slice output and convert to probabilities
+                            output_sliced = output[:,:233, :].exp()
 
                             # Calculate per-sample metrics for visualization
                             per_sample_metrics = self.metrics.calculate_per_sample_metrics(
-                                output.exp(), targets, node_mask
+                                output_sliced, targets, node_mask
                             )
-
-                            # Visualize predictions with metrics
                             visualize_predictions(
-                                output.exp(),
+                                output_sliced,
                                 targets,
                                 filenames=file_paths,
                                 metrics_list=per_sample_metrics,
                                 save_path=self.vis_dir / f"predictions_epoch{epoch}_ex{example_idx}.png"
                             )
-
-                            print(f"Prediction metrics: Acc={metrics_dict['note_accuracy']:.3f}, "
-                                  f"Precision={metrics_dict['precision']:.3f}, Recall={metrics_dict['recall']:.3f}, "
-                                  f"F1={metrics_dict['f1']:.3f}, MSE={metrics_dict['mse']:.4f}")
-                            print(f"  Onset: P={metrics_dict['onset_precision']:.3f}, R={metrics_dict['onset_recall']:.3f}, F1={metrics_dict['onset_f1']:.3f}")
-                            print(f"  TP={int(metrics_dict['tp'])}, FP={int(metrics_dict['fp'])}, FN={int(metrics_dict['fn'])}, TN={int(metrics_dict['tn'])}")
                         except Exception as e:
-                            print(f"Warning: Could not calculate metrics - {e}")
-                            import traceback
-                            traceback.print_exc()
+                            print(f"Warning: Could not visualize predictions - {e}")
 
                     # 3. Visualize graph structure
                     # Assuming data contains graph structure (edge_index, etc.)

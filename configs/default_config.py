@@ -35,6 +35,11 @@ class DefaultConfig:
         self.seed = 42
         self.num_pitches = 128
         self.time_step = 0.125
+
+        # Autoregressive bottleneck settings (defaults)
+        self.use_autoregressive_bottleneck = False
+        self.bottleneck_block_type = 'lightweight'
+
         # Optionally override with config file
         if config_path:
             self.load_from_file(config_path)
@@ -67,7 +72,9 @@ class DefaultConfig:
         print(f"Device: {self.device}")
         print(f"Seed: {self.seed}")
         print(f"num_composers: {self.num_composers}")
-        print(f"max_voices: {self.max_voices}") 
+        print(f"max_voices: {self.max_voices}")
+        print(f"use_autoregressive_bottleneck: {self.use_autoregressive_bottleneck}")
+        print(f"bottleneck_block_type: {self.bottleneck_block_type}") 
 
     def get_rhythm_label(self, rhythm_value):
         rhythm_value = min(float(rhythm_value), 5.0)
