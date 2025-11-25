@@ -7,19 +7,20 @@ import networkx as nx
 from mpl_toolkits.mplot3d import Axes3D
 
 
-def visualize_predictions(inputs, targets, filenames, save_path=None, max_samples=10):
+def visualize_predictions(inputs, targets, filenames, metrics_list=None, save_path=None, max_samples=10):
     """
-    Visualize batch predictions with input/target comparison and accuracy metrics.
+    Visualize batch predictions with input/target comparison.
 
     Args:
-        inputs: Tensor of shape [batch, node, seq] or [batch, seq] - model predictions
+        inputs: Tensor of shape [batch, node, seq] or [batch, seq] - model predictions (probabilities, not log probs)
         targets: Tensor of shape [batch, node, seq] or [batch, seq] - ground truth
         filenames: List of length batch - file identifiers for each example
+        metrics_list: Optional list of metric dicts (one per sample) to display. If None, no metrics shown.
         save_path: Optional path to save the visualization
         max_samples: Maximum number of samples to visualize (default 10)
 
     Returns:
-        dict: Accuracy metrics including precision, recall, f1, and note_accuracy
+        None
     """
     if torch.is_tensor(inputs):
         inputs = inputs.detach().cpu()
@@ -69,22 +70,6 @@ def visualize_predictions(inputs, targets, filenames, save_path=None, max_sample
         targets = torch.nn.functional.pad(targets, (0, nodes * seq - total_features))
         targets = targets.reshape(batch_size, nodes, seq)
 
-    # Calculate accuracy metrics
-    # Convert to binary (note on/off) for accuracy calculation
-    input_binary = (inputs > 0.5).float()
-    target_binary = (targets > 0.5).float()
-
-    # Per-example metrics
-    tp = (input_binary * target_binary).sum(dim=[1, 2])
-    fp = (input_binary * (1 - target_binary)).sum(dim=[1, 2])
-    fn = ((1 - input_binary) * target_binary).sum(dim=[1, 2])
-    tn = ((1 - input_binary) * (1 - target_binary)).sum(dim=[1, 2])
-
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
-    note_accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-8)
-
     # Create visualization
     fig, axes = plt.subplots(batch_size, 1, figsize=(16, 3 * batch_size))
     if batch_size == 1:
@@ -127,7 +112,9 @@ def visualize_predictions(inputs, targets, filenames, save_path=None, max_sample
 
         # Add filename and metrics to title
         title = f"{filenames[i]}\n"
-        title += f"Accuracy: {note_accuracy[i]:.3f} | Precision: {precision[i]:.3f} | Recall: {recall[i]:.3f} | F1: {f1[i]:.3f}"
+        if metrics_list and i < len(metrics_list):
+            m = metrics_list[i]
+            title += f"Accuracy: {m['note_accuracy']:.3f} | Precision: {m['precision']:.3f} | Recall: {m['recall']:.3f} | F1: {m['f1']:.3f}"
         axes[i].set_title(title, fontsize=10)
         axes[i].set_xlabel("Time Steps")
         axes[i].set_ylabel("Pitch (Node)")
@@ -167,17 +154,6 @@ def visualize_predictions(inputs, targets, filenames, save_path=None, max_sample
         plt.close()
     else:
         plt.show()
-
-    # Return aggregate metrics
-    metrics = {
-        'precision': precision.mean().item(),
-        'recall': recall.mean().item(),
-        'f1': f1.mean().item(),
-        'note_accuracy': note_accuracy.mean().item(),
-        'per_example_accuracy': note_accuracy.tolist()
-    }
-
-    return metrics
 
 
 def visualize_activations(activations_dict, inputs_dict, num_layers, save_path=None):

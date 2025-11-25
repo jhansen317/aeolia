@@ -139,11 +139,17 @@ class Trainer:
                             onset_dict = self.onset_metrics(output.exp(), targets, node_mask)
                             metrics_dict.update(onset_dict)
 
-                            # Visualize (this also calculates metrics internally for visualization)
+                            # Calculate per-sample metrics for visualization
+                            per_sample_metrics = self.metrics.calculate_per_sample_metrics(
+                                output.exp(), targets, node_mask
+                            )
+
+                            # Visualize predictions with metrics
                             visualize_predictions(
                                 output.exp(),
                                 targets,
                                 filenames=file_paths,
+                                metrics_list=per_sample_metrics,
                                 save_path=self.vis_dir / f"predictions_epoch{epoch}_ex{example_idx}.png"
                             )
 
