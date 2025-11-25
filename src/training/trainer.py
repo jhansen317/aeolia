@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 #from torch_geometric_temporal.signal import temporal_signal_split
 from src.data.dataset import MidiGraphDataset, temporal_graph_collate, batch_to_device
 from src.models.astgcn import PolyphonyGCN
+from src.training.metrics import MusicGenerationMetrics, NoteOnsetMetrics
 from configs.default_config import DefaultConfig
 from src.utils.visualization import (
     visualize_predictions,
@@ -52,6 +53,10 @@ class Trainer:
         self.composer_criterion = composer_criterion
         self.device = device
         self.config = config
+
+        # Initialize metrics
+        self.metrics = MusicGenerationMetrics(threshold=0.5)
+        self.onset_metrics = NoteOnsetMetrics(tolerance_frames=1)
         data_dir = project_root / "data" / "raw_test"
         self.checkpoint_dir = project_root / "checkpoints"
         self.checkpoint_dir.mkdir(exist_ok=True)
@@ -120,23 +125,37 @@ class Trainer:
                         save_path=self.vis_dir / f"activations_epoch{epoch}_ex{example_idx}.png"
                     )
 
-                    # 2. Visualize predictions vs targets
-                    # Assuming output and data have the right structure
+                    # 2. Calculate metrics and visualize predictions
                     if hasattr(data, 'file_paths') or 'file_paths' in data:
                         try:
                             file_paths = data.get('file_paths') if isinstance(data, dict) else data.file_paths
                             targets = data.get('targets') if isinstance(data, dict) else data.targets
+                            node_mask = data.get('node_mask') if isinstance(data, dict) else getattr(data, 'node_mask', None)
 
-                            metrics = visualize_predictions(
+                            # Calculate metrics using proper metrics module
+                            metrics_dict = self.metrics(output, targets, node_mask)
+
+                            # Also calculate onset metrics
+                            onset_dict = self.onset_metrics(output.exp(), targets, node_mask)
+                            metrics_dict.update(onset_dict)
+
+                            # Visualize (this also calculates metrics internally for visualization)
+                            visualize_predictions(
                                 output.exp(),
                                 targets,
                                 filenames=file_paths,
                                 save_path=self.vis_dir / f"predictions_epoch{epoch}_ex{example_idx}.png"
                             )
-                            print(f"Prediction metrics: Acc={metrics['note_accuracy']:.3f}, "
-                                  f"Precision={metrics['precision']:.3f}, Recall={metrics['recall']:.3f}, F1={metrics['f1']:.3f}")
+
+                            print(f"Prediction metrics: Acc={metrics_dict['note_accuracy']:.3f}, "
+                                  f"Precision={metrics_dict['precision']:.3f}, Recall={metrics_dict['recall']:.3f}, "
+                                  f"F1={metrics_dict['f1']:.3f}, MSE={metrics_dict['mse']:.4f}")
+                            print(f"  Onset: P={metrics_dict['onset_precision']:.3f}, R={metrics_dict['onset_recall']:.3f}, F1={metrics_dict['onset_f1']:.3f}")
+                            print(f"  TP={int(metrics_dict['tp'])}, FP={int(metrics_dict['fp'])}, FN={int(metrics_dict['fn'])}, TN={int(metrics_dict['tn'])}")
                         except Exception as e:
-                            print(f"Warning: Could not visualize predictions - {e}")
+                            print(f"Warning: Could not calculate metrics - {e}")
+                            import traceback
+                            traceback.print_exc()
 
                     # 3. Visualize graph structure
                     # Assuming data contains graph structure (edge_index, etc.)
