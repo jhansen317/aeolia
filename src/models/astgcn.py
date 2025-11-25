@@ -1158,5 +1158,136 @@ class PolyphonyGCN(torch.nn.Module):
         return x
 
     def predict(self, databatch):
-        x, _, _ = self.forward(databatch)
-        return x.argmax(dim=1)
+        x = self.forward(databatch)
+        return x.argmax(dim=-2)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        seed_sequence,
+        num_steps,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        return_graphs=False
+    ):
+        """
+        Generate music autoregressively from a seed sequence.
+
+        Args:
+            seed_sequence: Initial sequence dictionary with same structure as databatch
+                Must contain: 'features', 'feature_indices', 'input_graphs', etc.
+            num_steps: Number of timesteps to generate
+            temperature: Sampling temperature (higher = more random)
+            top_k: If set, only sample from top k most likely tokens
+            top_p: If set, nucleus sampling (sample from top tokens with cumulative prob > p)
+            return_graphs: Whether to return graph structures for each timestep
+
+        Returns:
+            generated_sequence: Dictionary with generated features and indices
+            graphs: (optional) List of generated graph structures
+        """
+        self.eval()
+        device = next(self.parameters()).device
+
+        # Initialize from seed
+        current_features = seed_sequence['features'].to(device)  # (batch, nodes, time)
+        current_indices = seed_sequence['feature_indices'].to(device)
+
+        batch_size = current_features.shape[0]
+        num_nodes = current_features.shape[1]
+
+        # We'll grow the sequence by appending new timesteps
+        generated_features = [current_features]
+        generated_indices = [current_indices]
+        generated_graphs = [] if return_graphs else None
+
+        for step in range(num_steps):
+            # Prepare current state as a batch
+            curr_batch = {
+                'features': current_features,
+                'feature_indices': current_indices,
+                'input_graphs': seed_sequence.get('input_graphs'),
+                'target_graphs': seed_sequence.get('target_graphs'),
+                'global_graph': seed_sequence.get('global_graph'),
+                'node_mask': (current_features.sum(dim=-1) > 0),
+            }
+
+            # Forward pass to get predictions for next timestep
+            logits = self.forward(curr_batch)  # (batch, nodes, time)
+
+            # Take prediction for the last timestep
+            next_logits = logits[:, :, -1]  # (batch, nodes)
+
+            # Apply temperature
+            next_logits = next_logits / temperature
+
+            # Apply top-k filtering
+            if top_k is not None:
+                indices_to_remove = next_logits < torch.topk(next_logits, top_k, dim=-1)[0][..., -1, None]
+                next_logits[indices_to_remove] = -float('inf')
+
+            # Apply nucleus (top-p) filtering
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                # Remove tokens with cumulative probability above threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift right to keep first token above threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+
+                # Scatter back to original indexing
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    -1, sorted_indices, sorted_indices_to_remove
+                )
+                next_logits[indices_to_remove] = -float('inf')
+
+            # Sample from the distribution
+            probs = F.softmax(next_logits, dim=-1)
+            next_features = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(batch_size, num_nodes)
+
+            # For now, use indices that correspond to the sampled features
+            # This is a simplification - you may want more sophisticated index generation
+            next_indices = torch.where(
+                next_features > 0,
+                torch.arange(num_nodes, device=device).unsqueeze(0).expand(batch_size, -1),
+                torch.zeros_like(next_features)
+            )
+
+            # Append to sequence
+            next_features_expanded = next_features.unsqueeze(-1)  # (batch, nodes, 1)
+            next_indices_expanded = next_indices.unsqueeze(-1)
+
+            current_features = torch.cat([current_features, next_features_expanded], dim=-1)
+            current_indices = torch.cat([current_indices, next_indices_expanded], dim=-1)
+
+            generated_features.append(next_features_expanded)
+            generated_indices.append(next_indices_expanded)
+
+            # Optionally construct and store graph for this timestep
+            if return_graphs:
+                # TODO: Build graph structure from generated notes
+                generated_graphs.append(None)  # Placeholder
+
+            # Sliding window: keep only last seq_length timesteps to prevent memory issues
+            max_length = self.config.periods
+            if current_features.shape[-1] > max_length:
+                current_features = current_features[:, :, -max_length:]
+                current_indices = current_indices[:, :, -max_length:]
+
+        # Concatenate all generated timesteps
+        all_features = torch.cat(generated_features, dim=-1)
+        all_indices = torch.cat(generated_indices, dim=-1)
+
+        result = {
+            'features': all_features,
+            'feature_indices': all_indices,
+            'num_steps_generated': num_steps
+        }
+
+        if return_graphs:
+            result['graphs'] = generated_graphs
+
+        return result

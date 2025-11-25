@@ -1,19 +1,22 @@
-# Aeolia: Graph Neural Networks for Composer Classification
+# Aeolia: Autoregressive Music Generation with Graph Neural Networks
 
-Aeolia is a deep learning project that applies **Attention-based Spatial-Temporal Graph Convolutional Networks (ASTGCN)** to the task of composer identification from polyphonic music. The system converts MIDI compositions into graph structures and uses graph neural networks to classify the composer.
+Aeolia is a deep learning project that applies **Attention-based Spatial-Temporal Graph Convolutional Networks (ASTGCN)** to autoregressive music generation. The system represents polyphonic MIDI as temporal graphs and generates new compositions by predicting the next timestep autoregressively.
 
 ## Overview
 
-This project adapts the ASTGCN architecture (originally designed for traffic flow forecasting) to music information retrieval. Musical compositions are represented as temporal graphs where:
-- **Nodes**: MIDI pitches (0-127)
+This project adapts the ASTGCN architecture (originally designed for traffic flow forecasting) to music generation. Musical compositions are represented as temporal graphs where:
+- **Nodes**: MIDI pitches (0-127), voice assignments, and rhythm values
 - **Edges**: Temporal connections between voices in polyphonic music
 - **Node Features**: Pitch, voice, and rhythm embeddings
-- **Task**: Multi-class classification of 47 classical composers
+- **Task**: Autoregressive next-timestep prediction for music generation
+- **Training**: Teacher forcing on 47 classical composers (14,782 compositions)
 
 ## Key Features
 
 - **Graph-based Music Representation**: Converts polyphonic MIDI into dynamic graph structures
-- **Attention Mechanisms**: Spatial and temporal attention for learning composer-specific patterns
+- **Autoregressive Generation**: Next-timestep prediction with teacher forcing during training
+- **Flexible Sampling**: Temperature, top-k, and nucleus (top-p) sampling for controlled generation
+- **Attention Mechanisms**: Spatial and temporal attention for learning musical patterns
 - **Spatio-Temporal Modeling**: Captures both harmonic relationships (spatial) and melodic progressions (temporal)
 - **Scalable Architecture**: Handles variable-length compositions and complex polyphonic textures
 
@@ -110,6 +113,33 @@ Key hyperparameters:
 python scripts/evaluate.py
 ```
 
+### Generating Music
+
+Generate new music autoregressively from a trained model:
+
+```bash
+# Generate from a trained checkpoint
+python scripts/generate.py \
+    --checkpoint models/best_model.pth \
+    --num_steps 200 \
+    --temperature 0.8 \
+    --top_p 0.9 \
+    --output generated_music.pt
+
+# Export to MIDI
+python scripts/export_midi.py \
+    --input generated_music.pt \
+    --output output.mid
+```
+
+**Generation parameters:**
+- `--temperature`: Controls randomness (0.5-2.0, default 1.0)
+  - Lower = more conservative, follows training data closely
+  - Higher = more creative/random
+- `--top_k`: Sample from top K most likely tokens (optional)
+- `--top_p`: Nucleus sampling - sample from top tokens with cumulative probability > p (default 0.9)
+- `--num_steps`: Number of timesteps to generate
+
 ### Data Preprocessing
 
 ```bash
@@ -125,7 +155,8 @@ The system uses the **PolyphonyGCN** model from [src/models/astgcn.py](src/model
 3. **TemporalAttention**: Multi-head attention over time dimension (melodic patterns)
 4. **STAttentionBlock**: Spatio-temporal fusion block
 5. **ASTGCNBlock**: Stacked attention blocks for hierarchical feature learning
-6. **Classification Head**: Final layers for composer prediction
+6. **Output Layer**: Log-softmax over token vocabulary for next-timestep prediction
+7. **Generation Interface**: Autoregressive sampling with temperature/top-k/nucleus controls
 
 
 ## Citation
