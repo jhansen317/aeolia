@@ -2,6 +2,8 @@
 
 Aeolia is a deep learning project that applies **Attention-based Spatial-Temporal Graph Convolutional Networks (ASTGCN)** to autoregressive music generation. The system represents polyphonic MIDI as temporal graphs and generates new compositions by predicting the next timestep autoregressively.
 
+*Named after the aeolian harp, an instrument that sounds when wind passes through its strings.*
+
 ## Overview
 
 This project adapts the ASTGCN architecture (originally designed for traffic flow forecasting) to music generation. Musical compositions are represented as temporal graphs where:
@@ -157,6 +159,39 @@ The system uses the **PolyphonyGCN** model from [src/models/astgcn.py](src/model
 5. **ASTGCNBlock**: Stacked attention blocks for hierarchical feature learning
 6. **Output Layer**: Log-softmax over token vocabulary for next-timestep prediction
 7. **Generation Interface**: Autoregressive sampling with temperature/top-k/nucleus controls
+
+## Harmonization Learning via Voice Dropout
+
+Aeolia incorporates **voice-level dropout** during training to explicitly learn harmonization. During each training step, individual voice nodes are randomly masked (zeroed out) across all timesteps with probability `voice_dropout_rate` (default 20%).
+
+### Why Voice Dropout?
+
+When a voice is masked:
+- The model receives **no information** about that voice's notes
+- Graph edges from the voice node remain, but carry no features
+- The model must predict the voice's notes using only:
+  - Other active voices (harmonic context)
+  - Pitch and rhythm structure
+  - Composer style embeddings
+  - Temporal patterns learned through attention
+
+This creates an implicit **harmonization objective**: the model learns to "fill in" missing voices based on musical context, similar to how a composer would harmonize a melody.
+
+### Musical Benefits
+
+1. **Improved polyphonic coherence**: Model learns voice interdependencies explicitly
+2. **Better voice leading**: Forced to predict voice motion from harmonic context
+3. **Robust generation**: Model less prone to generating harmonically incoherent voices
+4. **Implicit counterpoint**: Learns contrapuntal relationships between voices
+
+### Configuration
+
+```yaml
+# In config.yml
+voice_dropout_rate: 0.2  # 20% chance each voice is masked (0.0 to disable)
+```
+
+Set to `0.0` to disable voice dropout and train with all voices visible.
 
 
 ## Citation

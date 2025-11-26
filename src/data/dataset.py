@@ -102,8 +102,6 @@ class MidiGraphDataset(Dataset):
         return len(self.segments)
     
     def __getitem__(self, idx):
-
-        print(f'idx: {idx}, file_path: {self.segments[idx][0]}')
         """
         Returns a single PyG Data object containing the full sequence
         """
@@ -201,13 +199,13 @@ class MidiGraphDataset(Dataset):
                 dest_nodes.append(composer_node_id) # last node is composer, which will be populated by different embeddings
                 edge_attr.append(velocity)
 
-            # Connect voices to their pitches
-            for (src_pitch, src_veloc) in zip(active_pitches, active_velocities):
-
-                for (dest_pitch, dest_veloc) in zip(active_pitches, active_velocities):
-                    src_nodes.append(src_pitch)
-                    dest_nodes.append(dest_pitch)
-                    edge_attr.append((src_veloc+dest_veloc)/2.) # edge weight between pitches is the average velocity
+            # Optional: Connect all simultaneous pitches (expensive, may be redundant)
+            if self.config.connect_simultaneous_pitches:
+                for (src_pitch, src_veloc) in zip(active_pitches, active_velocities):
+                    for (dest_pitch, dest_veloc) in zip(active_pitches, active_velocities):
+                        src_nodes.append(src_pitch)
+                        dest_nodes.append(dest_pitch)
+                        edge_attr.append((src_veloc+dest_veloc)/2.) # edge weight between pitches is the average velocity
             src_nodes.append(composer_node_id) # make sure there's at least one edge at every timestep, even between a composer and themselves
             dest_nodes.append(composer_node_id)
             edge_attr.append(1.)
@@ -338,8 +336,14 @@ class MidiGraphDataset(Dataset):
 
 
 
-def temporal_graph_collate(batch):
-    """Collate function for batching temporal graph data."""
+def temporal_graph_collate(batch, use_global_graph=True):
+    """
+    Collate function for batching temporal graph data.
+
+    Args:
+        batch: List of data items from dataset
+        use_global_graph: If True, only build global graph (faster). If False, build per-timestep graphs.
+    """
     batch = [item for item in batch if item is not None]
     if not batch:
         return None
@@ -358,33 +362,36 @@ def temporal_graph_collate(batch):
     file_paths = [item['file_paths'][0] for item in batch]
     node_mask = torch.stack([item['node_mask'] for item in batch])
 
-    # Collect per-timestep edge indices and attributes
-    # Each item has lists of edge_index/edge_attr per timestep
-    seq_len = len(batch[0]['input_edge_index'])
+    # Conditionally create per-timestep graphs (expensive, only if needed)
+    if use_global_graph:
+        # Skip per-timestep graph construction - use empty lists as placeholders
+        input_graphs = []
+        target_graphs = []
+    else:
+        # Build per-timestep graphs (slower)
+        seq_len = len(batch[0]['input_edge_index'])
+        input_graphs = []
+        target_graphs = []
 
-    # Create batched graphs per timestep
-    input_graphs = []
-    target_graphs = []
+        for t in range(seq_len):
+            # Batch input graphs for this timestep
+            input_data_list = []
+            target_data_list = []
 
-    for t in range(seq_len):
-        # Batch input graphs for this timestep
-        input_data_list = []
-        target_data_list = []
+            for item in batch:
+                input_data_list.append(Data(
+                    edge_index=item['input_edge_index'][t],
+                    edge_attr=item['input_edge_attr'][t],
+                    num_nodes=item['num_nodes']
+                ))
+                target_data_list.append(Data(
+                    edge_index=item['target_edge_index'][t],
+                    edge_attr=item['target_edge_attr'][t],
+                    num_nodes=item['num_nodes']
+                ))
 
-        for item in batch:
-            input_data_list.append(Data(
-                edge_index=item['input_edge_index'][t],
-                edge_attr=item['input_edge_attr'][t],
-                num_nodes=item['num_nodes']
-            ))
-            target_data_list.append(Data(
-                edge_index=item['target_edge_index'][t],
-                edge_attr=item['target_edge_attr'][t],
-                num_nodes=item['num_nodes']
-            ))
-
-        input_graphs.append(Batch.from_data_list(input_data_list))
-        target_graphs.append(Batch.from_data_list(target_data_list))
+            input_graphs.append(Batch.from_data_list(input_data_list))
+            target_graphs.append(Batch.from_data_list(target_data_list))
 
     # Build global graph per batch item (union of all timesteps)
     global_graph_list = []

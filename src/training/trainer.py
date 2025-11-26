@@ -30,7 +30,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)  # Disabled for performance - only enable for debugging
+if os.environ.get('DEBUG_AUTOGRAD', '0') == '1':
+    torch.autograd.set_detect_anomaly(True)
+    logger.warning("Autograd anomaly detection enabled - training will be ~10x slower")
 
 activations = {}
 inputs = {}
@@ -49,9 +52,9 @@ class Trainer:
         model.encoder[0].register_forward_hook(save_activation('encoderlayer0'))
         model.encoder[1].register_forward_hook(save_activation('encoderlayer1'))
         model.encoder[2].register_forward_hook(save_activation('encoderlayer2'))
-        model.decoder[0].register_forward_hook(save_activation('decoderlayer0'))
+        model.decoder[2].register_forward_hook(save_activation('decoderlayer0'))
         model.decoder[1].register_forward_hook(save_activation('decoderlayer1'))
-        model.decoder[2].register_forward_hook(save_activation('decoderlayer2'))
+        model.decoder[0].register_forward_hook(save_activation('decoderlayer2'))
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -159,9 +162,19 @@ class Trainer:
                 logger.warning(f"Could not visualize predictions: {e}")
 
         # 3. Visualize graph structure
-        if hasattr(data, 'edge_index') or 'input_graphs' in data:
+        if hasattr(data, 'edge_index') or 'input_graphs' in data or 'global_graph' in data:
             try:
-                graph_data = data.get('input_graphs', [None])[0] if isinstance(data, dict) else data
+                # Use global_graph if available (when use_global_graph=True), otherwise first per-timestep graph
+                if isinstance(data, dict):
+                    if 'global_graph' in data and data['global_graph'] is not None:
+                        graph_data = data['global_graph']
+                    elif 'input_graphs' in data and len(data['input_graphs']) > 0:
+                        graph_data = data['input_graphs'][0]
+                    else:
+                        graph_data = None
+                else:
+                    graph_data = data
+
                 if graph_data is not None:
                     fig_graph = visualize_graph_structure(
                         graph_data,
@@ -259,7 +272,7 @@ class Trainer:
                 self.log_batch_metrics(epoch, example_idx, loss, data, output)
 
                 # Visualizations (every 5 batches to avoid overhead)
-                if (example_idx % 5) == 0:
+                if (example_idx % 10) == 0:
                     self.log_visualizations(epoch, example_idx, data, output)
 
                 # Backward pass and optimization

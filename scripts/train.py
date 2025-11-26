@@ -3,6 +3,7 @@ import sys
 import torch
 import logging
 from pathlib import Path
+from functools import partial
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from datetime import datetime
@@ -71,15 +72,23 @@ def main():
 
     logger.info(f"Dataset loaded: {len(dataset)} segments")
 
-    # Create dataloader
+    # Create dataloader with config-aware collate function
     batch_size = config.batch_size if config.batch_size <= len(dataset) else len(dataset)
+    collate_fn = partial(temporal_graph_collate, use_global_graph=config.use_global_graph)
+
+    # Determine pin_memory based on device (MPS doesn't support it)
+    pin_memory = True # config.pin_memory and config.device != 'mps'
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=temporal_graph_collate
+        collate_fn=collate_fn,
+        num_workers=config.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=config.num_workers > 0  # Keep workers alive between epochs
     )
-    logger.info(f"DataLoader created with batch size: {batch_size}")
+    logger.info(f"DataLoader created with batch size: {batch_size}, num_workers: {config.num_workers}, pin_memory: {pin_memory}")
 
     # Create model
     logger.info("Initializing model...")

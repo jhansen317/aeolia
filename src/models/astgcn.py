@@ -1279,6 +1279,45 @@ class PolyphonyGCN(torch.nn.Module):
         self.config = config
 
 
+    def apply_voice_dropout(self, x, training=True):
+        """
+        Apply voice-level dropout during training.
+
+        Masks entire voice nodes across all timesteps by zeroing their features.
+        This forces the model to learn harmonization by predicting masked voices
+        from other voices, pitches, rhythms, and composer context.
+
+        Args:
+            x: Input features [batch, num_nodes, input_dim, timesteps]
+            training: Whether in training mode
+
+        Returns:
+            x with voice nodes randomly masked, voice_mask indicating which voices were kept
+        """
+        if not training or self.config.voice_dropout_rate == 0.0:
+            return x, None
+
+        batch_size = x.shape[0]
+        device = x.device
+
+        # Voice node indices
+        voice_start = self.config.num_pitches
+        voice_end = voice_start + self.config.num_voices
+
+        # Create dropout mask: [batch, num_voices]
+        # Each voice independently has (1 - dropout_rate) probability of being kept
+        voice_mask = torch.rand(batch_size, self.config.num_voices, device=device) > self.config.voice_dropout_rate
+
+        # Expand mask to match x shape: [batch, num_voices] -> [batch, num_voices, input_dim, timesteps]
+        voice_mask_expanded = voice_mask.unsqueeze(-1).unsqueeze(-1).expand(
+            batch_size, self.config.num_voices, x.shape[2], x.shape[3]
+        )
+
+        # Apply mask to voice nodes only
+        x[:, voice_start:voice_end, :, :] = x[:, voice_start:voice_end, :, :] * voice_mask_expanded.float()
+
+        return x, voice_mask
+
     @torch.no_grad()
     def make_positional_sinusoids(self):
         """
@@ -1394,9 +1433,12 @@ class PolyphonyGCN(torch.nn.Module):
         x_emb = self.get_inputs(x_indices)
         x = x.unsqueeze(-2) * x_emb
 
-        use_global = getattr(self.config, 'use_global_graph', False)
+        # Apply voice dropout during training (for harmonization learning)
+        x, voice_mask = self.apply_voice_dropout(x, training=self.training)
 
-        use_global = True  # TODO: make configurable
+        # Use config setting for graph structure
+        use_global = getattr(self.config, 'use_global_graph', True)
+
         if use_global:
             # Use global graph - just pass the single graph, blocks will reuse it
             global_graph = databatch['global_graph']

@@ -28,6 +28,8 @@ class DefaultConfig:
         self.learning_rate = 0.001
         self.batch_size = 4  # Reduced for MPS memory constraints
         self.num_epochs = 100
+        self.num_workers = 4  # Number of data loading worker processes
+        self.pin_memory = True  # Pin memory for faster GPU transfers (disable for MPS)
         self.model_save_path = project_root / 'models/'
         self.data_path = project_root / 'data/'
         self.log_path = project_root / 'logs/'
@@ -39,6 +41,13 @@ class DefaultConfig:
         # Autoregressive bottleneck settings (defaults)
         self.use_autoregressive_bottleneck = False
         self.bottleneck_block_type = 'lightweight'
+
+        # Graph structure options
+        self.connect_simultaneous_pitches = False  # If True, create complete graph between pitches at same timestep
+        self.use_global_graph = True  # If True, use single global graph; if False, use per-timestep graphs (slower)
+
+        # Voice dropout for harmonization learning
+        self.voice_dropout_rate = 0.2  # Probability of masking each voice node during training
 
         # Optionally override with config file
         if config_path:
@@ -66,6 +75,8 @@ class DefaultConfig:
         print(f"Learning Rate: {self.learning_rate}")
         print(f"Batch Size: {self.batch_size}")
         print(f"Number of Epochs: {self.num_epochs}")
+        print(f"Num Workers: {self.num_workers}")
+        print(f"Pin Memory: {self.pin_memory}")
         print(f"Model Save Path: {self.model_save_path}")
         print(f"Data Path: {self.data_path}")
         print(f"Log Path: {self.log_path}")
@@ -74,7 +85,10 @@ class DefaultConfig:
         print(f"num_composers: {self.num_composers}")
         print(f"max_voices: {self.max_voices}")
         print(f"use_autoregressive_bottleneck: {self.use_autoregressive_bottleneck}")
-        print(f"bottleneck_block_type: {self.bottleneck_block_type}") 
+        print(f"bottleneck_block_type: {self.bottleneck_block_type}")
+        print(f"connect_simultaneous_pitches: {self.connect_simultaneous_pitches}")
+        print(f"use_global_graph: {self.use_global_graph}")
+        print(f"voice_dropout_rate: {self.voice_dropout_rate}") 
 
     def get_rhythm_label(self, rhythm_value):
         rhythm_value = min(float(rhythm_value), 5.0)
