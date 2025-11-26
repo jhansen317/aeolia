@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 # Global threshold for note on/off detection
-NOTE_THRESHOLD = 0.01
+NOTE_THRESHOLD = 0.05
 
 
 class MusicGenerationMetrics:

@@ -1,5 +1,5 @@
 K: 3
-input_dim: 512
+input_dim: 256
 time_kernels: [35, 19, 5]
 strides: [3, 3, 3]
 periods: 200

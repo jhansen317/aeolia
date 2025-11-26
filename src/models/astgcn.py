@@ -934,7 +934,8 @@ class ASTGCNBlock(nn.Module):
         cross_channels: int,
         cross_timesteps: int,
         temporal_conv: Optional[bool] = False,
-        causal_mask: Optional[bool] = False
+        causal_mask: Optional[bool] = False,
+        is_decoder: Optional[bool] = False
     ):
         super(ASTGCNBlock, self).__init__()
         self.padding = self_time_kernel-1
@@ -954,6 +955,7 @@ class ASTGCNBlock(nn.Module):
         self.cross_channels = cross_channels
         self.cross_timesteps = cross_timesteps
         self.temporal_conv = temporal_conv
+        self.is_decoder = is_decoder
         #print(f'time_att_strides: {time_att_strides}, time_kernel: {time_kernel}, time_dilations: {time_dilations}')
         self.st_att = STAttention(self.self_space_channels_in,
                                   self.self_space_channels_out,
@@ -963,7 +965,7 @@ class ASTGCNBlock(nn.Module):
                                   k=self.K,
                                   causal_mask=causal_mask
                                   )
-        
+
         #if self.self_timesteps_in < self.self_timesteps_out:
         self.st_clusters = STAttention(self.self_space_channels_in,
                                     self.out_nodes,
@@ -982,7 +984,24 @@ class ASTGCNBlock(nn.Module):
                                     k=self.K,
                                     causal_mask=causal_mask
                                     )'''
-        self._time_convolution = nn.Conv2d(
+
+        # Main temporal path: use transposed conv for decoder upsampling
+        if is_decoder and self.self_time_strides > 1:
+            # Decoder: Use TRANSPOSED convolution for learnable upsampling
+            # Don't use output_padding - let interpolate handle exact sizing
+            self._time_convolution = nn.ConvTranspose2d(
+                self.self_time_channels_in,
+                self.self_time_channels_out,
+                kernel_size=(1, self.time_kernel),
+                stride=(1, self.self_time_strides),
+                padding=(0, (self.time_kernel - 1) // 2),
+                output_padding=(0, 0),
+                bias=False,
+                groups=self.self_time_channels_in
+            )
+        else:
+            # Encoder: Use regular strided convolution for downsampling
+            self._time_convolution = nn.Conv2d(
                 self.self_time_channels_in,
                 self.self_time_channels_out,
                 kernel_size=(1, self.time_kernel),
@@ -991,6 +1010,7 @@ class ASTGCNBlock(nn.Module):
                 bias=False,
                 groups=self.self_time_channels_in
             )
+
         self._time_convolution_clusters = nn.Conv2d(
                 self.out_nodes,
                 self.out_nodes,
@@ -999,10 +1019,29 @@ class ASTGCNBlock(nn.Module):
                 padding=(0, 0),
                 bias=False
             )
-        self._residual_convolution = nn.Conv2d(
-            self.self_space_channels_in, self.self_time_channels_out, kernel_size=(1, 1), stride=(1, self.self_time_strides),
-            bias=False, groups=self.self_space_channels_in
-        )
+
+        # Residual path: use interpolate for decoder, strided conv for encoder
+        if is_decoder and self.self_time_strides > 1:
+            # Decoder residual: 1x1 conv for channel adjustment ONLY
+            # We'll use interpolate for temporal upsampling (stable, no artifacts)
+            self._residual_convolution = nn.Conv2d(
+                self.self_space_channels_in,
+                self.self_time_channels_out,
+                kernel_size=(1, 1),
+                stride=(1, 1),  # NO stride - we interpolate separately
+                bias=False,
+                groups=self.self_space_channels_in
+            )
+        else:
+            # Encoder residual: 1x1 conv with stride for downsampling
+            self._residual_convolution = nn.Conv2d(
+                self.self_space_channels_in,
+                self.self_time_channels_out,
+                kernel_size=(1, 1),
+                stride=(1, self.self_time_strides),
+                bias=False,
+                groups=self.self_space_channels_in
+            )
         self._layer_norm = nn.LayerNorm(self.self_time_channels_out, bias=False)
 
     def forward(
@@ -1030,32 +1069,58 @@ class ASTGCNBlock(nn.Module):
 
         X_hat = self.st_att(X, input_graphs)
 
-        
+
         if X.shape[1] != X_hat.shape[1]:
             X = F.interpolate(X.permute(0,3,2,1), [num_of_features, self.out_nodes])
             X = X.permute(0,3,2,1)
 
-        if self.self_time_strides == 1:
-            if X_hat.shape[-1] != self.self_timesteps_out:
-                X_hat = F.interpolate(X_hat, [num_of_features, self.self_timesteps_out])
-            if X.shape[-1] != self.self_timesteps_out:
-                X = F.interpolate(X, [num_of_features, self.self_timesteps_out])
-        #F.pad(X_hat, (((self.time_conv_kern)*self.dilation_factor)-1, 0))
-        X_hat = F.pad(X_hat, (self.padding, 0))
-        X_hat = self._time_convolution(X_hat.permute(0, 2, 1, 3)) #[:,:,:,-self.timesteps_out:] # will give (32, 64, 307,12)
-        #X_hat = F.dropout(X_hat, p=GLOBAL_DROPOUT, training=self.training)
-        # (b,N,F,T)-permute>(b,F,N,T) (1,1)->(b,F,N,T)  (32, 64, 307, 12)
-        
+        # ===== MAIN PATH: Temporal convolution =====
+        X_hat_permuted = X_hat.permute(0, 2, 1, 3)  # (B, F, N, T)
 
-            
-        X = self._residual_convolution(X.permute(0, 2, 1, 3))     # will also give (32, 64, 307,12)
-        #-adding X + X_hat->(32, 64, 307, 12)-premuting-> (32, 12, 307, 64)-layer_normalization_-premuting->(32, 307, 64,12) 
+        if self.is_decoder and self.self_time_strides > 1:
+            # Decoder: Transposed conv for upsampling
+            X_hat = self._time_convolution(X_hat_permuted)
 
+            # Fine-tune to exact target size if needed
+            current_t = X_hat.shape[-1]
+            if current_t != self.self_timesteps_out:
+                X_hat = F.interpolate(X_hat, size=(X_hat.shape[2], self.self_timesteps_out))
+        else:
+            # Encoder: Regular strided conv with padding
+            if self.self_time_strides == 1:
+                if X_hat_permuted.shape[-1] != self.self_timesteps_out:
+                    X_hat_permuted = F.interpolate(X_hat_permuted, [X_hat_permuted.shape[2], self.self_timesteps_out])
 
-        
+            X_hat_permuted = F.pad(X_hat_permuted, (self.padding, 0))
+            X_hat = self._time_convolution(X_hat_permuted)
 
-        X = self._layer_norm(F.gelu(X+X_hat).permute(0, 2, 3, 1))
-        
+        # ===== RESIDUAL PATH =====
+        X_residual = X.permute(0, 2, 1, 3)  # (B, F, N, T)
+
+        if self.is_decoder and self.self_time_strides > 1:
+            # Decoder: Interpolate first, then 1x1 conv (stable upsampling)
+            target_t = X_hat.shape[-1]  # Match the main path output
+            X_residual = F.interpolate(
+                X_residual,
+                size=(X_residual.shape[2], target_t),
+                mode='nearest'
+            )
+            X_residual = self._residual_convolution(X_residual)
+        else:
+            # Encoder: 1x1 strided conv
+            if self.self_time_strides == 1:
+                if X.shape[-1] != self.self_timesteps_out:
+                    X_residual = F.interpolate(
+                        X_residual,
+                        [num_of_features, self.self_timesteps_out]
+                    )
+            X_residual = self._residual_convolution(X_residual)
+
+        #-adding X_residual + X_hat->(32, 64, 307, 12)-permuting-> (32, 12, 307, 64)-layer_normalization-permuting->(32, 307, 64,12)
+
+        # ===== COMBINE AND NORMALIZE =====
+        X = self._layer_norm(F.gelu(X_residual + X_hat).permute(0, 2, 3, 1))
+
         X = X.permute(0, 1, 3, 2)
         return X, input_graphs, input_graphs, 0.0 # (b,N,F,T) for example (32, 307, 64,12)
 
@@ -1102,7 +1167,8 @@ class PolyphonyGCN(torch.nn.Module):
                     config.input_dim,
                     config.time_kernels[i],
                     temporal_conv=True,
-                    causal_mask=True
+                    causal_mask=True,
+                    is_decoder=False  # Encoder blocks use regular conv
                 )
                 for i in blocknums
             ]
@@ -1137,7 +1203,7 @@ class PolyphonyGCN(torch.nn.Module):
                     config.input_dim,
                     config.input_dim,
                     config.time_kernels[i],
-                    1,
+                    config.strides[i],  # Use same stride as encoder for symmetric up/down
                     config.periods_out[i],
                     config.periods_in[i],
                     config.input_dim,
@@ -1146,7 +1212,8 @@ class PolyphonyGCN(torch.nn.Module):
                     config.input_dim,
                     config.time_kernels[i],
                     temporal_conv=True,
-                    causal_mask=True
+                    causal_mask=True,
+                    is_decoder=True  # Decoder blocks use transposed conv
                 )
             )
 
@@ -1191,7 +1258,8 @@ class PolyphonyGCN(torch.nn.Module):
                     config.input_dim,
                     config.time_kernels[i],
                     temporal_conv=True,
-                    causal_mask=True
+                    causal_mask=True,
+                    is_decoder=False  # Pooling block doesn't need transposed conv
                 )
 
         self._final_conv = nn.Conv2d(
