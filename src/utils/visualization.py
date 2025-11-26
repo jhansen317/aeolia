@@ -155,11 +155,12 @@ def visualize_predictions(inputs, targets, filenames, metrics_list=None, save_pa
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+        return None
     else:
-        plt.show()
+        return fig
 
 
-def visualize_activations(activations_dict, inputs_dict, num_layers, model_input=None, model_output=None, save_path=None):
+def visualize_activations(activations_dict, inputs_dict, num_layers, model_input=None, model_output=None, node_mask=None, save_path=None):
     """
     Visualize all intermediate activations from model layers in a single figure.
     Picks one random example from the batch.
@@ -174,6 +175,7 @@ def visualize_activations(activations_dict, inputs_dict, num_layers, model_input
         num_layers: Number of layers to visualize
         model_input: Original input to the model (shape: batch, nodes, features, time)
         model_output: Final output from the model after exp() (shape: batch, nodes, time)
+        node_mask: Optional boolean mask (shape: batch, nodes) indicating active nodes in the graph
         save_path: Optional path to save the visualization
     """
     # Pick one random example index (consistent across all layers)
@@ -186,12 +188,14 @@ def visualize_activations(activations_dict, inputs_dict, num_layers, model_input
     if model_input is not None:
         all_layer_data.append(('Input', model_input, True))  # True = is input/output
 
-    # Add encoder and decoder layers
+    # Add all encoder layers first
     for layer in range(num_layers):
         encoder_act = activations_dict.get(f'encoderlayer{layer}')
         if encoder_act is not None:
             all_layer_data.append((f'Encoder {layer}', encoder_act, False))
 
+    # Then add all decoder layers
+    for layer in range(num_layers):
         decoder_act = activations_dict.get(f'decoderlayer{layer}')
         if decoder_act is not None:
             all_layer_data.append((f'Decoder {layer}', decoder_act, False))
@@ -206,6 +210,54 @@ def visualize_activations(activations_dict, inputs_dict, num_layers, model_input
         print("No activation data to visualize")
         return
 
+    # Pick random example index first (before computing active nodes mask)
+    first_data = all_layer_data[0][1]
+    if torch.is_tensor(first_data):
+        first_data = first_data.detach().cpu()
+    if first_data.ndim >= 1:
+        batch_size = first_data.shape[0]
+        random_idx = torch.randint(0, batch_size, (1,)).item()
+    else:
+        random_idx = 0
+
+    # Get the node mask for the selected example if provided
+    if node_mask is not None:
+        if torch.is_tensor(node_mask):
+            node_mask = node_mask.detach().cpu()
+        active_nodes_mask = node_mask[random_idx].numpy()  # [num_nodes]
+    else:
+        active_nodes_mask = None
+
+    # Process each layer to get 2D representations
+    # Store the 2D data for each layer to avoid recomputing
+    layer_data_2d = []
+
+    for name, data, is_input_output in all_layer_data:
+        if torch.is_tensor(data):
+            data = data.detach().cpu()
+
+        # Select the random example
+        if data.ndim >= 1:
+            data = data[random_idx]
+
+        # Convert to 2D [nodes, time]
+        if is_input_output:
+            if data.ndim == 3:
+                data_2d = data.mean(dim=1)  # [nodes, features, time] -> [nodes, time]
+            elif data.ndim == 2:
+                data_2d = data
+            else:
+                data_2d = data.unsqueeze(0)
+        else:
+            if data.ndim == 3:
+                data_2d = (data ** 2).mean(dim=1)  # [nodes, features, time] -> [nodes, time]
+            elif data.ndim == 2:
+                data_2d = data
+            else:
+                data_2d = data.unsqueeze(0)
+
+        layer_data_2d.append(data_2d)
+
     # Create vertical stack of subplots
     fig, axes = plt.subplots(num_plots, 1, figsize=(16, 2 * num_plots))
     if num_plots == 1:
@@ -214,39 +266,12 @@ def visualize_activations(activations_dict, inputs_dict, num_layers, model_input
     for idx, (name, data, is_input_output) in enumerate(all_layer_data):
         ax = axes[idx]
 
-        # Convert to CPU and numpy
-        if torch.is_tensor(data):
-            data = data.detach().cpu()
+        # Get the precomputed 2D data for this layer
+        data_2d = layer_data_2d[idx].numpy()
 
-        # Pick random example on first iteration
-        if random_idx is None and data.ndim >= 1:
-            batch_size = data.shape[0]
-            random_idx = torch.randint(0, batch_size, (1,)).item()
-
-        # Select single random example
-        if data.ndim >= 1:
-            data = data[random_idx]
-
-        # Process data based on whether it's input/output or hidden layer
-        if is_input_output:
-            # For input/output: show as [nodes, time]
-            if data.ndim == 3:
-                # Input: [nodes, features, time] -> take mean over features
-                data_2d = data.mean(dim=1).numpy()
-            elif data.ndim == 2:
-                # Output: [nodes, time]
-                data_2d = data.numpy()
-            else:
-                data_2d = data.unsqueeze(0).numpy()
-        else:
-            # For hidden layers: compute node-level energy as mean(activations^2)
-            if data.ndim == 3:
-                # [nodes, features, time] -> [nodes, time]
-                data_2d = (data ** 2).mean(dim=1).numpy()
-            elif data.ndim == 2:
-                data_2d = data.numpy()
-            else:
-                data_2d = data.unsqueeze(0).numpy()
+        # Apply the node mask if provided (mask out inactive nodes from the graph)
+        if active_nodes_mask is not None and len(active_nodes_mask) == data_2d.shape[0]:
+            data_2d = data_2d[active_nodes_mask]
 
         # Plot without any labels or ticks
         ax.imshow(data_2d, aspect='auto', origin='lower', cmap='viridis', interpolation='nearest')
@@ -265,8 +290,9 @@ def visualize_activations(activations_dict, inputs_dict, num_layers, model_input
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+        return None
     else:
-        plt.show()
+        return fig
 
 
 def visualize_graph_structure(data, save_path=None, render_3d=True, max_samples=10):
@@ -422,5 +448,6 @@ def visualize_graph_structure(data, save_path=None, render_3d=True, max_samples=
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+        return None
     else:
-        plt.show()
+        return fig

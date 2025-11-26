@@ -19,6 +19,7 @@ sys.path.append(str(project_root))
 from src.models.astgcn import PolyphonyGCN
 from src.data.dataset import MidiGraphDataset
 from configs.default_config import DefaultConfig
+from src.utils.midi_tensor_converter import tensor_to_midi, batch_tensor_to_midi
 
 
 def load_model(checkpoint_path, config):
@@ -93,10 +94,57 @@ def generate_from_seed(
     return generated
 
 
-def save_generated_sequence(generated, output_path):
-    """Save generated sequence to file."""
+def save_generated_sequence(generated, output_path, config, convert_to_midi=True, midi_output_dir=None):
+    """Save generated sequence to file and optionally convert to MIDI."""
     torch.save(generated, output_path)
     print(f"Saved generated sequence to {output_path}")
+
+    if convert_to_midi:
+        # Determine MIDI output directory
+        if midi_output_dir is None:
+            midi_output_dir = Path(output_path).parent / 'generated_midi'
+        else:
+            midi_output_dir = Path(midi_output_dir)
+
+        midi_output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\nConverting to MIDI...")
+        print(f"  - Output directory: {midi_output_dir}")
+
+        # Extract the features tensor
+        features = generated['features']
+
+        # Handle different possible shapes
+        if features.dim() == 3:
+            # Already (batch_size, seq_length, num_nodes) or needs transpose
+            if features.shape[1] > features.shape[2]:
+                # Likely (batch_size, seq_length, num_nodes)
+                pass
+            else:
+                # Likely (batch_size, num_nodes, seq_length)
+                features = features.transpose(1, 2)
+        elif features.dim() == 2:
+            # Add batch dimension: (seq_length, num_nodes)
+            features = features.unsqueeze(0)
+
+        batch_size = features.shape[0]
+
+        # Convert batch to MIDI files
+        midi_objects = batch_tensor_to_midi(
+            features=features,
+            output_dir=midi_output_dir,
+            prefix="generated",
+            time_step=0.25,
+            num_pitches=config.num_pitches,
+            num_voices=config.num_voices,
+            tempo=120.0,
+            program=0,  # Acoustic Grand Piano
+            velocity_threshold=0.01
+        )
+
+        print(f"  - Generated {len(midi_objects)} MIDI file(s)")
+        for i in range(batch_size):
+            print(f"    - {midi_output_dir / f'generated_{i:04d}.mid'}")
 
 
 def main():
@@ -128,6 +176,11 @@ def main():
     parser.add_argument('--output', type=str,
                         default=str(project_root / 'generated_music.pt'),
                         help='Output path for generated sequence')
+    parser.add_argument('--midi_output_dir', type=str,
+                        default=None,
+                        help='Output directory for MIDI files (default: generated_midi/ in same dir as output)')
+    parser.add_argument('--no_midi', action='store_true',
+                        help='Skip MIDI conversion')
 
     args = parser.parse_args()
 
@@ -171,10 +224,22 @@ def main():
     )
 
     # Save output
-    save_generated_sequence(generated, args.output)
+    save_generated_sequence(
+        generated=generated,
+        output_path=args.output,
+        config=config,
+        convert_to_midi=not args.no_midi,
+        midi_output_dir=args.midi_output_dir
+    )
 
     print("\nGeneration complete!")
-    print(f"To convert to MIDI, use: python scripts/export_midi.py --input {args.output}")
+    if not args.no_midi:
+        print(f"\nNext steps:")
+        print(f"1. Listen to the generated MIDI files")
+        print(f"2. Experiment with different temperatures, top_k, and top_p values")
+        print(f"3. Try different seed sequences")
+    else:
+        print(f"\nTo convert to MIDI later, use the tensor_to_midi utilities from src.utils")
 
 
 if __name__ == '__main__':
