@@ -145,5 +145,113 @@ def pool_edge_indices(datalist, output_length=10, reduce='mean'):
         
     outDataList = [Data(edge_index=edge_index,
                                  edge_attr=edge_attr.to(torch.float), x=pooled_x) for (edge_index, edge_attr, pooled_x) in zip(pooled_edge_indices, pooled_edge_attr, pooled_xs)]
-    
+
     return outDataList
+
+
+def unpool_graphs(graph_list, target_length):
+    """
+    Repeat/interpolate graphs to match target length.
+
+    Args:
+        graph_list: List of PyG Batch objects, Data objects, or single temporal batch
+        target_length: Desired output length
+
+    Returns:
+        List of PyG Batch/Data objects with length = target_length
+    """
+    # Handle temporal batch (single Data object with time_index)
+    if len(graph_list) == 1 and hasattr(graph_list[0], 'time_index'):
+        temporal_batch = graph_list[0]
+        current_length = temporal_batch.num_timesteps
+
+        if current_length == target_length:
+            return graph_list
+
+        # Remap time indices via repetition
+        repeat_factor = target_length // current_length
+        remainder = target_length % current_length
+
+        # Create new time index mapping
+        new_time_indices = []
+        for old_t in range(current_length):
+            repeats = repeat_factor + (1 if old_t < remainder else 0)
+            new_time_indices.extend([old_t] * repeats)
+
+        # Map old time indices to new time indices
+        time_mapping = torch.zeros(current_length, dtype=torch.long)
+        new_time_counter = 0
+        for old_t in range(current_length):
+            time_mapping[old_t] = new_time_counter
+            repeats = repeat_factor + (1 if old_t < remainder else 0)
+            new_time_counter += repeats
+
+        # Update time indices in the batch
+        old_time_idx = temporal_batch.time_index
+        new_time_idx = time_mapping[old_time_idx]
+
+        # Create new temporal batch with updated indices
+        unpooled_batch = Data(
+            edge_index=temporal_batch.edge_index.clone(),
+            edge_attr=temporal_batch.edge_attr.clone() if temporal_batch.edge_attr is not None else None,
+            time_index=new_time_idx,
+            batch_index=temporal_batch.batch_index.clone(),
+            num_nodes=temporal_batch.num_nodes,
+            num_timesteps=target_length,
+            batch_size=temporal_batch.batch_size
+        )
+
+        return [unpooled_batch]
+
+    # Handle list of regular graphs (original behavior)
+    if len(graph_list) == target_length:
+        return graph_list
+
+    repeat_factor = target_length // len(graph_list)
+    remainder = target_length % len(graph_list)
+
+    unpooled = []
+    for i, graph in enumerate(graph_list):
+        repeats = repeat_factor + (1 if i < remainder else 0)
+        unpooled.extend([graph] * repeats)
+
+    return unpooled
+
+
+def pool_temporal_batch(temporal_batch, target_length, reduce='mean'):
+    """
+    Pool a temporal batch by merging consecutive timesteps.
+
+    Args:
+        temporal_batch: Data object with time_index attribute
+        target_length: Target number of timesteps
+        reduce: How to combine edge attributes ('mean', 'max', 'sum')
+
+    Returns:
+        New Data object with pooled timesteps
+    """
+    if not hasattr(temporal_batch, 'time_index'):
+        raise ValueError("Expected temporal batch with time_index attribute")
+
+    current_length = temporal_batch.num_timesteps
+
+    if current_length == target_length:
+        return temporal_batch
+
+    # Compute chunk mapping: which new timestep does each old timestep map to?
+    chunk_size = current_length / target_length
+    time_mapping = torch.floor(temporal_batch.time_index / chunk_size).long()
+    time_mapping = torch.clamp(time_mapping, 0, target_length - 1)
+
+    # Update temporal batch with new time indices
+    pooled_batch = Data(
+        edge_index=temporal_batch.edge_index.clone(),
+        edge_attr=temporal_batch.edge_attr.clone() if temporal_batch.edge_attr is not None else None,
+        time_index=time_mapping,
+        batch_index=temporal_batch.batch_index.clone(),
+        num_nodes=temporal_batch.num_nodes,
+        num_timesteps=target_length,
+        batch_size=temporal_batch.batch_size
+    )
+
+    return pooled_batch
