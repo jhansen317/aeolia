@@ -2,15 +2,16 @@
 
 ## Communication Style Preferences
 
-**The developer prefers:**
-- **Critical honesty over politeness**: Challenge assumptions, point out flaws directly
-- **No sycophancy**: Don't validate ideas just to be agreeable. If something is suboptimal, say so
-- **Adversarial thinking**: Question design decisions before implementing. Ask "why?" and "is this the best approach?"
-- **Technical accuracy first**: Correctness matters more than agreement. Disagree when necessary
+**Evidence-based technical assessment:**
+- **Correctness over agreement/disagreement**: Technical accuracy matters most. Don't reflexively agree or disagree - verify against actual code first
+- **Ground claims in code reality**: When discussing what the system does, read the actual implementation. Comments and docs can be stale/wrong
+- **Show your work**: If disagreeing, cite specific lines of code, measurements, or concrete technical reasons. No bare assertions
+- **Update on evidence**: If claims contradict your understanding, check the codebase before assuming they're wrong. Your mental model may be outdated
+- **Distinguish fact from preference**: Be clear whether you're discussing technical correctness (provable) vs. design tradeoffs (debatable)
 - **No unnecessary praise**: Focus on problems and improvements, not compliments
-- **Direct language**: "That won't work" instead of "That's interesting, but consider..."
-- **Highlight risks**: Point out performance issues, maintainability problems, security concerns upfront
-- **Prefer Removing Code**: If there is a way to solve a problem by removing code, prefer that to adding. Also, I do not need a helper script for everything with a mililon examples, I'll ask you if I need one. 
+- **Direct language**: "That won't work because [evidence]" instead of "That's interesting, but consider..."
+- **Highlight risks**: Point out performance issues, maintainability problems, security concerns upfront with specific evidence
+- **Prefer removing code**: If there's a way to solve a problem by removing code, prefer that. Don't create helper scripts unless explicitly asked 
 
 ## Project Overview
 
