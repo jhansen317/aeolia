@@ -42,15 +42,19 @@ def batch_to_device(batch, device):
     return result
 
 class MidiGraphDataset(Dataset):
-    def __init__(self, npz_dir, seq_length=32, time_step=0.25, max_pitch=127, config=None):
+    def __init__(self, npz_dir, seq_length=32, time_step=0.25, max_pitch=127, config=None, split='train', val_split=0.1, seed=42):
         """
         A simplified MIDI dataset using a sequence of PyG Data objects
-        
+
         Args:
             npz_dir: Directory with preprocessed sparse MIDI files
             seq_length: Number of time steps to include
             time_step: Time between steps in seconds
             max_pitch: Maximum MIDI pitch to consider
+            config: Configuration object
+            split: 'train', 'val', or 'all' (default: 'train')
+            val_split: Fraction of data to use for validation (default: 0.1)
+            seed: Random seed for reproducible splits (default: 42)
         """
         self.npz_dir = Path(npz_dir)
         self.seq_length = seq_length
@@ -58,13 +62,20 @@ class MidiGraphDataset(Dataset):
         self.max_pitch = max_pitch
         self.lags = 20
         self.config = config
+        self.split = split
+        self.val_split = val_split
+        self.seed = seed
+
         print(f"Loading dataset from {self.npz_dir}")
         print(f'loading composer mapping')
         # Load composer mapping
 
         # Build segment index
-        self.segments = self._build_segment_index()
-        
+        all_segments = self._build_segment_index()
+
+        # Split segments into train/val if requested
+        self.segments = self._apply_split(all_segments)
+
         # Fixed feature dimensions for consistency
 
     def _build_segment_index(self):
@@ -97,7 +108,46 @@ class MidiGraphDataset(Dataset):
         
         print(f"Found {len(segments)} segments across {len(set(s[0] for s in segments))} files")
         return segments
-    
+
+    def _apply_split(self, segments):
+        """
+        Split segments into train/val sets.
+        Uses file-level splitting to ensure segments from the same file stay together.
+        """
+        if self.split == 'all':
+            print(f"Using all {len(segments)} segments")
+            return segments
+
+        # Group segments by file
+        from collections import defaultdict
+        file_segments = defaultdict(list)
+        for seg in segments:
+            file_path = seg[0]
+            file_segments[file_path].append(seg)
+
+        # Get sorted list of files for reproducibility
+        files = sorted(file_segments.keys())
+
+        # Split files into train/val
+        np.random.seed(self.seed)
+        shuffled_files = np.random.permutation(files)
+
+        n_val_files = max(1, int(len(files) * self.val_split))
+        val_files = set(shuffled_files[:n_val_files])
+        train_files = set(shuffled_files[n_val_files:])
+
+        # Collect segments based on split
+        if self.split == 'train':
+            split_segments = [seg for f in train_files for seg in file_segments[f]]
+            print(f"Train split: {len(split_segments)} segments from {len(train_files)} files")
+        elif self.split == 'val':
+            split_segments = [seg for f in val_files for seg in file_segments[f]]
+            print(f"Val split: {len(split_segments)} segments from {len(val_files)} files")
+        else:
+            raise ValueError(f"Invalid split: {self.split}. Must be 'train', 'val', or 'all'")
+
+        return split_segments
+
     def __len__(self):
         return len(self.segments)
     
@@ -179,26 +229,6 @@ class MidiGraphDataset(Dataset):
                 dest_nodes.append(voice_id)
                 edge_attr.append(velocity)
 
-                # pitch x composer
-                src_nodes.append(pitch)
-                dest_nodes.append(composer_node_id) # last node is composer, which will be populated by different embeddings
-                edge_attr.append(velocity)
-
-                # composer x pitch
-                src_nodes.append(composer_node_id)
-                dest_nodes.append(pitch)
-                edge_attr.append(velocity)
-
-                # composer x voice
-                src_nodes.append(composer_node_id)
-                dest_nodes.append(voice_id)
-                edge_attr.append(velocity)
-
-                # voice x composer
-                src_nodes.append(voice_id)
-                dest_nodes.append(composer_node_id) # last node is composer, which will be populated by different embeddings
-                edge_attr.append(velocity)
-
             # Optional: Connect all simultaneous pitches (expensive, may be redundant)
             if self.config.connect_simultaneous_pitches:
                 for (src_pitch, src_veloc) in zip(active_pitches, active_velocities):
@@ -206,9 +236,13 @@ class MidiGraphDataset(Dataset):
                         src_nodes.append(src_pitch)
                         dest_nodes.append(dest_pitch)
                         edge_attr.append((src_veloc+dest_veloc)/2.) # edge weight between pitches is the average velocity
-            src_nodes.append(composer_node_id) # make sure there's at least one edge at every timestep, even between a composer and themselves
-            dest_nodes.append(composer_node_id)
-            edge_attr.append(1.)
+
+            # Ensure at least one edge exists (use first pitch self-loop if available)
+            if len(src_nodes) == 0:
+                src_nodes.append(0)
+                dest_nodes.append(0)
+                edge_attr.append(0.0)
+
             edge_index, edge_attr = coalesce(torch.stack([torch.tensor(src_nodes, dtype=torch.long), torch.tensor(dest_nodes, dtype=torch.long)]), torch.tensor(edge_attr, dtype=torch.float32), reduce='mean')
 
 
@@ -226,14 +260,16 @@ class MidiGraphDataset(Dataset):
 
 
 
-        # Create piano roll tensor (time_steps × max_voices+1)
+        # Create piano roll tensor (time_steps × nodes)
         # Values represent velocities (0 = note off)
-        piano_roll = torch.zeros(self.seq_length,  self.config.num_nodes if self.config else 128)
-        features = torch.zeros((self.seq_length, self.config.num_nodes))
+        # Note: num_nodes now excludes composer node (233 nodes instead of 234)
+        num_content_nodes = self.config.num_nodes - 1  # Exclude composer node
+        piano_roll = torch.zeros(self.seq_length, num_content_nodes)
+        features = torch.zeros((self.seq_length, num_content_nodes))
 
-        targets = torch.zeros((self.seq_length, self.config.num_nodes))
-        feature_indices = torch.zeros((self.seq_length, self.config.num_nodes))
-        target_indices = torch.zeros((self.seq_length, self.config.num_nodes))
+        targets = torch.zeros((self.seq_length, num_content_nodes))
+        feature_indices = torch.zeros((self.seq_length, num_content_nodes))
+        target_indices = torch.zeros((self.seq_length, num_content_nodes))
         # Create voice roll tensor (time_steps × max_pitch+1)
         # Values represent voice IDs (-1 = no voice/note off)
         voice_roll = torch.zeros(self.seq_length, self.config.num_pitches)
@@ -297,11 +333,7 @@ class MidiGraphDataset(Dataset):
             target_edge_index.append(step_targets['edge_index'])
             target_edge_attr.append(step_targets['edge_attr'])
 
-        max_node = self.config.num_nodes-1
-        features[:, max_node] = 1.
-        feature_indices[:, max_node] = composer_id + self.config.num_nodes
-        targets[:, max_node] = 1.
-        target_indices[:, max_node] = composer_id + self.config.num_nodes
+        # Composer is now stored separately, not as a node in the graph
         data = {
             'piano_roll': piano_roll,
             'voice_roll': voice_roll,
@@ -317,7 +349,7 @@ class MidiGraphDataset(Dataset):
             'target_indices': target_indices,
             'total_labels': self.config.num_labels,
             'file_paths': file_paths,
-            'num_nodes': self.config.num_nodes,
+            'num_nodes': num_content_nodes,  # 233 nodes (excluding composer)
             'node_mask': features.sum(dim=0) > 0,  # Mask for nodes with features
         }
 
@@ -336,13 +368,17 @@ class MidiGraphDataset(Dataset):
 
 
 
-def temporal_graph_collate(batch, use_global_graph=True):
+
+
+def temporal_graph_collate(batch, use_global_graph=False, config=None, voice_dropout_rate=0.0):
     """
     Collate function for batching temporal graph data.
 
     Args:
         batch: List of data items from dataset
         use_global_graph: If True, only build global graph (faster). If False, build per-timestep graphs.
+        config: Model config
+        voice_dropout_rate: Unused
     """
     batch = [item for item in batch if item is not None]
     if not batch:
@@ -368,30 +404,75 @@ def temporal_graph_collate(batch, use_global_graph=True):
         input_graphs = []
         target_graphs = []
     else:
-        # Build per-timestep graphs (slower)
+        # Build temporal batch (smarter: single batch with time indexing)
         seq_len = len(batch[0]['input_edge_index'])
-        input_graphs = []
-        target_graphs = []
+        batch_size = len(batch)
+        num_nodes = batch[0]['num_nodes']
 
-        for t in range(seq_len):
-            # Batch input graphs for this timestep
-            input_data_list = []
-            target_data_list = []
+        # Collect all edges with temporal and batch indices
+        all_input_edges = []
+        all_input_attrs = []
+        all_input_time_indices = []
+        all_input_batch_indices = []
 
-            for item in batch:
-                input_data_list.append(Data(
-                    edge_index=item['input_edge_index'][t],
-                    edge_attr=item['input_edge_attr'][t],
-                    num_nodes=item['num_nodes']
-                ))
-                target_data_list.append(Data(
-                    edge_index=item['target_edge_index'][t],
-                    edge_attr=item['target_edge_attr'][t],
-                    num_nodes=item['num_nodes']
-                ))
+        all_target_edges = []
+        all_target_attrs = []
+        all_target_time_indices = []
+        all_target_batch_indices = []
 
-            input_graphs.append(Batch.from_data_list(input_data_list))
-            target_graphs.append(Batch.from_data_list(target_data_list))
+        for b_idx, item in enumerate(batch):
+            for t in range(seq_len):
+                # Input graphs
+                if item['input_edge_index'][t].numel() > 0:
+                    # Offset edges by (batch_idx * num_nodes) for proper batching
+                    offset_edges = item['input_edge_index'][t] + (b_idx * num_nodes)
+                    all_input_edges.append(offset_edges)
+                    all_input_attrs.append(item['input_edge_attr'][t])
+                    # Track which timestep these edges belong to
+                    num_edges = offset_edges.shape[1]
+                    all_input_time_indices.append(torch.full((num_edges,), t, dtype=torch.long))
+                    all_input_batch_indices.append(torch.full((num_edges,), b_idx, dtype=torch.long))
+
+                # Target graphs
+                if item['target_edge_index'][t].numel() > 0:
+                    offset_edges = item['target_edge_index'][t] + (b_idx * num_nodes)
+                    all_target_edges.append(offset_edges)
+                    all_target_attrs.append(item['target_edge_attr'][t])
+                    num_edges = offset_edges.shape[1]
+                    all_target_time_indices.append(torch.full((num_edges,), t, dtype=torch.long))
+                    all_target_batch_indices.append(torch.full((num_edges,), b_idx, dtype=torch.long))
+
+        # Create single temporal batch for input
+        if all_input_edges:
+            input_temporal_batch = Data(
+                edge_index=torch.cat(all_input_edges, dim=1),
+                edge_attr=torch.cat(all_input_attrs, dim=0),
+                time_index=torch.cat(all_input_time_indices, dim=0),
+                batch_index=torch.cat(all_input_batch_indices, dim=0),
+                num_nodes=num_nodes * batch_size,
+                num_timesteps=seq_len,
+                batch_size=batch_size
+            )
+        else:
+            input_temporal_batch = None
+
+        # Create single temporal batch for target
+        if all_target_edges:
+            target_temporal_batch = Data(
+                edge_index=torch.cat(all_target_edges, dim=1),
+                edge_attr=torch.cat(all_target_attrs, dim=0),
+                time_index=torch.cat(all_target_time_indices, dim=0),
+                batch_index=torch.cat(all_target_batch_indices, dim=0),
+                num_nodes=num_nodes * batch_size,
+                num_timesteps=seq_len,
+                batch_size=batch_size
+            )
+        else:
+            target_temporal_batch = None
+
+        # Return as single-item list for compatibility with existing code
+        input_graphs = [input_temporal_batch] if input_temporal_batch else []
+        target_graphs = [target_temporal_batch] if target_temporal_batch else []
 
     # Build global graph per batch item (union of all timesteps)
     global_graph_list = []
