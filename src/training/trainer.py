@@ -52,9 +52,9 @@ class Trainer:
         model.encoder[0].register_forward_hook(save_activation('encoderlayer0'))
         model.encoder[1].register_forward_hook(save_activation('encoderlayer1'))
         model.encoder[2].register_forward_hook(save_activation('encoderlayer2'))
-        model.decoder[2].register_forward_hook(save_activation('decoderlayer0'))
+        model.decoder[0].register_forward_hook(save_activation('decoderlayer0'))
         model.decoder[1].register_forward_hook(save_activation('decoderlayer1'))
-        model.decoder[0].register_forward_hook(save_activation('decoderlayer2'))
+        model.decoder[2].register_forward_hook(save_activation('decoderlayer2'))
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -109,8 +109,17 @@ class Trainer:
         logger.info(f"Loaded checkpoint from {path}, epoch {checkpoint['epoch']}, loss {checkpoint['loss']}")
         return checkpoint['epoch'], checkpoint['loss']
 
-    def log_visualizations(self, epoch, example_idx, data, output):
-        """Log all visualizations to TensorBoard."""
+    def log_visualizations(self, epoch, example_idx, data, output, mode='train'):
+        """
+        Log all visualizations to TensorBoard with proper train/val separation.
+
+        Args:
+            epoch: Current epoch
+            example_idx: Batch index
+            data: Input data batch
+            output: Model output
+            mode: 'train' or 'val' to tag visualizations appropriately
+        """
 
         # Prepare data
         model_input = data.get('features') if isinstance(data, dict) else getattr(data, 'features', None)
@@ -119,7 +128,10 @@ class Trainer:
         if node_mask_vis is not None:
             node_mask_vis = node_mask_vis[:, :233]
 
-        # 1. Visualize activations
+        # Determine if dropout is active (training mode)
+        dropout_status = "with_dropout" if self.model.training else "no_dropout"
+
+        # 1. Visualize activations - SEPARATE BY MODE AND DROPOUT STATUS
         fig_activations = visualize_activations(
             activations,
             inputs,
@@ -130,9 +142,20 @@ class Trainer:
             save_path=None  # Don't save to file, return figure
         )
         if fig_activations is not None:
-            self.tb_logger.log_figure('visualizations/activations', fig_activations, self.global_step)
+            # Use hierarchical tags: mode/visualization_type/dropout_status
+            tag = f'{mode}/activations/{dropout_status}'
+            self.tb_logger.log_figure(tag, fig_activations, self.global_step)
 
-        # 2. Visualize predictions
+            # Also log metadata about this visualization
+            metadata = (
+                f"Mode: {mode} | "
+                f"Dropout: {'Active' if self.model.training else 'Inactive'} | "
+                f"Epoch: {epoch} | "
+                f"Batch: {example_idx} | "
+                f"Step: {self.global_step}"
+            )
+
+        # 2. Visualize predictions - SEPARATE BY MODE
         if hasattr(data, 'file_paths') or 'file_paths' in data:
             try:
                 file_paths = data.get('file_paths') if isinstance(data, dict) else data.file_paths
@@ -157,11 +180,12 @@ class Trainer:
                     save_path=None  # Don't save to file, return figure
                 )
                 if fig_predictions is not None:
-                    self.tb_logger.log_figure('visualizations/predictions', fig_predictions, self.global_step)
+                    tag = f'{mode}/predictions/{dropout_status}'
+                    self.tb_logger.log_figure(tag, fig_predictions, self.global_step)
             except Exception as e:
                 logger.warning(f"Could not visualize predictions: {e}")
 
-        # 3. Visualize graph structure
+        # 3. Visualize graph structure - SEPARATE BY MODE
         if hasattr(data, 'edge_index') or 'input_graphs' in data or 'global_graph' in data:
             try:
                 # Use global_graph if available (when use_global_graph=True), otherwise first per-timestep graph
@@ -182,11 +206,12 @@ class Trainer:
                         render_3d=True
                     )
                     if fig_graph is not None:
-                        self.tb_logger.log_figure('visualizations/graph_structure', fig_graph, self.global_step)
+                        tag = f'{mode}/graph_structure'
+                        self.tb_logger.log_figure(tag, fig_graph, self.global_step)
             except Exception as e:
                 logger.warning(f"Could not visualize graph structure: {e}")
 
-    def log_batch_metrics(self, epoch, example_idx, loss, data, output):
+    def log_batch_metrics(self, epoch, example_idx, loss, data, output, kl_loss=None):
         """Log metrics for a single batch to TensorBoard."""
 
         # Log losses
@@ -196,12 +221,10 @@ class Trainer:
         if hasattr(data, 'file_paths') or 'file_paths' in data:
             try:
                 targets = data.get('targets') if isinstance(data, dict) else data.targets
-                targets = targets[:, :233, :]
                 node_mask = data.get('node_mask') if isinstance(data, dict) else getattr(data, 'node_mask', None)
-                node_mask = node_mask[:, :233]
 
-                # Slice output to match targets and node_mask dimensions
-                output_sliced = output[:, :233, :].exp()
+                # Note: No longer need to slice - composer node already removed from graph
+                output_sliced = output.exp()
 
                 # Calculate all metrics (frame-level and onset-based)
                 metrics_dict = self.metrics.calculate_metrics(output_sliced, targets, node_mask)
@@ -211,15 +234,20 @@ class Trainer:
                 # Log all metrics to TensorBoard
                 self.tb_logger.log_metrics_dict(metrics_dict, prefix='metrics/', step=self.global_step)
 
-                # Log a concise summary to console
-                logger.info(
+                # Build console log message
+                log_msg = (
                     f"Epoch {epoch+1}/{self.config.num_epochs} | "
                     f"Batch {example_idx} | "
-                    f"Loss: {loss.item():.4f} | "
-                    f"Acc: {metrics_dict['note_accuracy']:.3f} | "
+                    f"Loss: {loss.item():.4f}"
+                )
+                if kl_loss is not None:
+                    log_msg += f" | KL: {kl_loss:.4f}"
+                log_msg += (
+                    f" | Acc: {metrics_dict['note_accuracy']:.3f} | "
                     f"F1: {metrics_dict['f1']:.3f} | "
                     f"Onset F1: {metrics_dict['onset_f1']:.3f}"
                 )
+                logger.info(log_msg)
             except Exception as e:
                 logger.warning(f"Could not calculate metrics: {e}")
 
@@ -237,43 +265,79 @@ class Trainer:
             f"{'='*60}\n"
         )
 
-    def train(self, train_loader, epochs):
+    def train(self, train_loader, epochs, val_loader=None, validate_every_n_steps=None, start_epoch=0):
         """
-        Main training loop with clean TensorBoard logging.
+        Main training loop with clean TensorBoard logging and step-based validation.
 
         Args:
             train_loader: DataLoader for training data
             epochs: Number of epochs to train
+            val_loader: Optional DataLoader for validation data
+            validate_every_n_steps: Run validation every N steps (None = no step-based validation)
+            start_epoch: Epoch to start from (for resuming training)
         """
-        logger.info(f"Starting training for {epochs} epochs")
+        logger.info(f"Starting training for {epochs} epochs (starting from epoch {start_epoch})")
         logger.info(f"Device: {self.device}")
         logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
-        for epoch in range(epochs):
+        if val_loader is not None and validate_every_n_steps is not None:
+            logger.info(f"Step-based validation enabled: every {validate_every_n_steps} steps")
+
+        # VAE beta annealing setup (step-based, not epoch-based)
+        if hasattr(self.config, 'use_vae') and self.config.use_vae:
+            beta_start = getattr(self.config, 'beta_start', 0.0)
+            beta_end = getattr(self.config, 'beta_end', 0.01)
+            beta_anneal_steps = getattr(self.config, 'beta_anneal_steps', 10000)
+            logger.info(f"VAE enabled: beta annealing from {beta_start} to {beta_end} over {beta_anneal_steps} steps")
+
+        for epoch in range(start_epoch, epochs):
             self.model.train()
             total_loss = 0
 
             for example_idx, data in enumerate(train_loader):
+                # Update KL beta for annealing (step-based)
+                if hasattr(self.config, 'use_vae') and self.config.use_vae:
+                    if self.global_step < beta_anneal_steps:
+                        beta = beta_start + (beta_end - beta_start) * (self.global_step / beta_anneal_steps)
+                    else:
+                        beta = beta_end
+                    self.criterion.set_beta(beta)
                 # Move batch to device
                 data = batch_to_device(data, self.device)
 
                 # Forward pass
-                output = self.model(data)
+                model_output = self.model(data)
+
+                # Handle VAE output (tuple) vs regular output
+                mu, logvar = None, None
+                if isinstance(model_output, tuple):
+                    output, mu, logvar = model_output
+                else:
+                    output = model_output
 
                 # Check for NaN/Inf
                 if torch.isnan(output).any() or torch.isinf(output).any():
                     logger.error("NaN or Inf detected in model output!")
                     continue
 
-                # Calculate loss
-                loss = self.criterion(output, data)
+                # Calculate loss (criterion handles both tuple and tensor)
+                loss = self.criterion(model_output, data)
 
-                # Log batch metrics
-                self.log_batch_metrics(epoch, example_idx, loss, data, output)
+                # Calculate and log KL divergence if using VAE
+                kl_loss_value = None
+                if mu is not None and logvar is not None:
+                    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                    kl_loss = kl_loss / mu.numel()
+                    kl_loss_value = kl_loss.item()
+                    self.tb_logger.log_scalar('vae/kl_divergence', kl_loss_value, self.global_step)
+                    self.tb_logger.log_scalar('vae/beta', self.criterion.beta, self.global_step)
 
-                # Visualizations (every 5 batches to avoid overhead)
+                # Log batch metrics (use predictions only)
+                self.log_batch_metrics(epoch, example_idx, loss, data, output, kl_loss=kl_loss_value)
+
+                # Visualizations (every 10 batches to avoid overhead)
                 if (example_idx % 10) == 0:
-                    self.log_visualizations(epoch, example_idx, data, output)
+                    self.log_visualizations(epoch, example_idx, data, output, mode='train')
 
                 # Backward pass and optimization
                 self.optimizer.zero_grad()
@@ -296,6 +360,15 @@ class Trainer:
                 # Increment global step
                 self.global_step += 1
 
+                # Step-based validation
+                if val_loader is not None and validate_every_n_steps is not None:
+                    if self.global_step % validate_every_n_steps == 0:
+                        logger.info(f"\n{'='*60}")
+                        logger.info(f"Running validation at step {self.global_step}")
+                        logger.info(f"{'='*60}")
+                        val_loss = self.validate(val_loader)
+                        self.model.train()  # Return to training mode
+
                 # Clean up matplotlib figures
                 plt.close('all')
 
@@ -308,7 +381,7 @@ class Trainer:
 
     def validate(self, val_loader):
         """
-        Validation loop with TensorBoard logging.
+        Validation loop with TensorBoard logging and visualizations.
 
         Args:
             val_loader: DataLoader for validation data
@@ -318,7 +391,9 @@ class Trainer:
         all_metrics = []
 
         with torch.no_grad():
-            for data in val_loader:
+            for batch_idx, data in enumerate(val_loader):
+                if batch_idx > 10:
+                    break
                 data = batch_to_device(data, self.device)
                 output = self.model(data)
                 loss = self.criterion(output, data)
@@ -336,11 +411,17 @@ class Trainer:
                     onset_dict = self.onset_metrics(output_sliced, targets, node_mask)
                     metrics_dict.update(onset_dict)
                     all_metrics.append(metrics_dict)
+                    self.log_batch_metrics(0, batch_idx, loss, data, output)
+                    self.log_visualizations(0, batch_idx, data, output, mode='val')
                 except Exception as e:
                     logger.warning(f"Could not calculate validation metrics: {e}")
 
+                
+                
+                    
+
         # Average metrics across all batches
-        avg_loss = total_loss / len(val_loader)
+        avg_loss = total_loss / 10
 
         if all_metrics:
             avg_metrics = {}

@@ -41,6 +41,12 @@ def main():
     parser.add_argument('--run_name', type=str,
                         default=None,
                         help='Optional name for this training run (for TensorBoard)')
+    parser.add_argument('--checkpoint', type=str,
+                        default=None,
+                        help='Path to checkpoint file to resume training from')
+    parser.add_argument('--start_epoch', type=int,
+                        default=0,
+                        help='Starting epoch (overrides checkpoint epoch if provided)')
     args = parser.parse_args()
 
     # Load configuration
@@ -56,31 +62,56 @@ def main():
     logger.info(f"Learning rate: {config.learning_rate}")
     logger.info(f"Epochs: {config.num_epochs}")
 
-    # Load dataset
-    logger.info("Loading dataset...")
-    dataset = MidiGraphDataset(
+    # Load dataset with train/val splits
+    logger.info("Loading training dataset...")
+    train_dataset = MidiGraphDataset(
         npz_dir=Path(args.data_dir),
         seq_length=config.periods,
         time_step=config.time_step,
         max_pitch=127,
-        config=config
+        config=config,
+        split='train',
+        val_split=getattr(config, 'val_split', 0.1),
+        seed=config.seed
     )
 
-    if len(dataset) == 0:
-        logger.error("No data found in dataset!")
+    logger.info("Loading validation dataset...")
+    val_dataset = MidiGraphDataset(
+        npz_dir=Path(args.data_dir),
+        seq_length=config.periods,
+        time_step=config.time_step,
+        max_pitch=127,
+        config=config,
+        split='val',
+        val_split=getattr(config, 'val_split', 0.1),
+        seed=config.seed
+    )
+
+    if len(train_dataset) == 0:
+        logger.error("No training data found in dataset!")
         return
 
-    logger.info(f"Dataset loaded: {len(dataset)} segments")
+    if len(val_dataset) == 0:
+        logger.warning("No validation data found in dataset!")
 
-    # Create dataloader with config-aware collate function
-    batch_size = config.batch_size if config.batch_size <= len(dataset) else len(dataset)
-    collate_fn = partial(temporal_graph_collate, use_global_graph=config.use_global_graph)
+    logger.info(f"Train dataset: {len(train_dataset)} segments")
+    logger.info(f"Val dataset: {len(val_dataset)} segments")
+
+    # Create dataloaders with config-aware collate function
+    batch_size = config.batch_size if config.batch_size <= len(train_dataset) else len(train_dataset)
+    voice_dropout_rate = getattr(config, 'voice_dropout_rate', 0.0)
+    collate_fn = partial(
+        temporal_graph_collate,
+        use_global_graph=config.use_global_graph,
+        config=config,
+        voice_dropout_rate=voice_dropout_rate
+    )
 
     # Determine pin_memory based on device (MPS doesn't support it)
     pin_memory = True # config.pin_memory and config.device != 'mps'
 
-    dataloader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
@@ -88,7 +119,18 @@ def main():
         pin_memory=pin_memory,
         persistent_workers=config.num_workers > 0  # Keep workers alive between epochs
     )
-    logger.info(f"DataLoader created with batch size: {batch_size}, num_workers: {config.num_workers}, pin_memory: {pin_memory}")
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # No shuffling for validation
+        collate_fn=collate_fn,
+        num_workers=config.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=config.num_workers > 0
+    )
+    logger.info(f"Train DataLoader: batch size: {batch_size}, num_workers: {config.num_workers}, pin_memory: {pin_memory}")
+    logger.info(f"Val DataLoader: batch size: {batch_size}, num_workers: {config.num_workers}, pin_memory: {pin_memory}")
 
     # Create model
     logger.info("Initializing model...")
@@ -125,9 +167,23 @@ def main():
         tb_logger=tb_logger
     )
 
-    # Start training
+    # Load checkpoint if provided
+    start_epoch = args.start_epoch
+    if args.checkpoint:
+        logger.info(f"Loading checkpoint from: {args.checkpoint}")
+        checkpoint_epoch, _ = trainer.load_checkpoint(
+            args.checkpoint,
+            map_location=config.device
+        )
+        if args.start_epoch == 0:
+            start_epoch = checkpoint_epoch
+        logger.info(f"Resuming from epoch {start_epoch}")
+
+    # Start training with validation
     logger.info("Starting training...")
-    trainer.train(dataloader, config.num_epochs)
+    validate_every_n_steps = getattr(config, 'validate_every_n_steps', 50)
+    logger.info(f"Validation will run every {validate_every_n_steps} steps")
+    trainer.train(train_loader, config.num_epochs, val_loader=val_loader, validate_every_n_steps=validate_every_n_steps, start_epoch=start_epoch)
 
     logger.info("=" * 60)
     logger.info("Training complete!")
