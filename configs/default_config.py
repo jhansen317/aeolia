@@ -21,7 +21,7 @@ class DefaultConfig:
 
         self.periods = 300
         self.hidden_dim = 256
-        self.nodes_in = [234, 57, 20]
+        self.nodes_in = [233, 57, 20]  # 233 content nodes (no composer in encoder)
         self.nodes_out = [57, 20, 10]
         self.num_blocks = 2
         self.strides = [1 for i in range(self.num_blocks)]
@@ -38,9 +38,11 @@ class DefaultConfig:
         self.num_pitches = 128
         self.time_step = 0.125
 
-        # Autoregressive bottleneck settings (defaults)
-        self.use_autoregressive_bottleneck = False
-        self.bottleneck_block_type = 'lightweight'
+        # VAE settings
+        self.use_vae = True  # Enable VAE bottleneck for latent variable modeling
+        self.beta_start = 0.0  # KL weight at start of training
+        self.beta_end = 0.01  # KL weight at end of annealing
+        self.beta_anneal_epochs = 20  # Number of epochs to anneal beta from start to end
 
         # Graph structure options
         self.connect_simultaneous_pitches = False  # If True, create complete graph between pitches at same timestep
@@ -84,8 +86,10 @@ class DefaultConfig:
         print(f"Seed: {self.seed}")
         print(f"num_composers: {self.num_composers}")
         print(f"max_voices: {self.max_voices}")
-        print(f"use_autoregressive_bottleneck: {self.use_autoregressive_bottleneck}")
-        print(f"bottleneck_block_type: {self.bottleneck_block_type}")
+        print(f"use_vae: {self.use_vae}")
+        print(f"beta_start: {self.beta_start}")
+        print(f"beta_end: {self.beta_end}")
+        print(f"beta_anneal_epochs: {self.beta_anneal_epochs}")
         print(f"connect_simultaneous_pitches: {self.connect_simultaneous_pitches}")
         print(f"use_global_graph: {self.use_global_graph}")
         print(f"voice_dropout_rate: {self.voice_dropout_rate}") 
