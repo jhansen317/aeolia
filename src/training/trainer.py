@@ -211,11 +211,11 @@ class Trainer:
             except Exception as e:
                 logger.warning(f"Could not visualize graph structure: {e}")
 
-    def log_batch_metrics(self, epoch, example_idx, loss, data, output, kl_loss=None):
+    def log_batch_metrics(self, epoch, example_idx, loss, data, output, kl_loss=None, mode='train'):
         """Log metrics for a single batch to TensorBoard."""
 
-        # Log losses
-        self.tb_logger.log_scalar('loss/batch', loss.item(), self.global_step)
+        # Log losses with mode-specific prefix
+        self.tb_logger.log_scalar(f'loss/{mode}_batch', loss.item(), self.global_step)
 
         # Calculate and log detailed metrics
         if hasattr(data, 'file_paths') or 'file_paths' in data:
@@ -223,7 +223,7 @@ class Trainer:
                 targets = data.get('targets') if isinstance(data, dict) else data.targets
                 node_mask = data.get('node_mask') if isinstance(data, dict) else getattr(data, 'node_mask', None)
 
-                # Note: No longer need to slice - composer node already removed from graph
+                # Convert log probs to probs
                 output_sliced = output.exp()
 
                 # Calculate all metrics (frame-level and onset-based)
@@ -231,11 +231,13 @@ class Trainer:
                 onset_dict = self.onset_metrics(output_sliced, targets, node_mask)
                 metrics_dict.update(onset_dict)
 
-                # Log all metrics to TensorBoard
-                self.tb_logger.log_metrics_dict(metrics_dict, prefix='metrics/', step=self.global_step)
+                # Log all metrics to TensorBoard with mode prefix
+                self.tb_logger.log_metrics_dict(metrics_dict, prefix=f'{mode}_metrics/', step=self.global_step)
 
                 # Build console log message
+                mode_label = "VAL" if mode == 'val' else "TRAIN"
                 log_msg = (
+                    f"{mode_label} | "
                     f"Epoch {epoch+1}/{self.config.num_epochs} | "
                     f"Batch {example_idx} | "
                     f"Loss: {loss.item():.4f}"
@@ -366,7 +368,7 @@ class Trainer:
                         logger.info(f"\n{'='*60}")
                         logger.info(f"Running validation at step {self.global_step}")
                         logger.info(f"{'='*60}")
-                        val_loss = self.validate(val_loader)
+                        val_loss = self.validate(val_loader, epoch=epoch)
                         self.model.train()  # Return to training mode
 
                 # Clean up matplotlib figures
@@ -379,63 +381,75 @@ class Trainer:
         logger.info("Training complete!")
         self.tb_logger.close()
 
-    def validate(self, val_loader):
+    def validate(self, val_loader, epoch=0):
         """
         Validation loop with TensorBoard logging and visualizations.
 
         Args:
             val_loader: DataLoader for validation data
+            epoch: Current epoch number
         """
         self.model.eval()
         total_loss = 0
         all_metrics = []
+        num_batches = 0
 
         with torch.no_grad():
             for batch_idx, data in enumerate(val_loader):
-                if batch_idx > 10:
+                if batch_idx >= 10:
                     break
-                data = batch_to_device(data, self.device)
-                output = self.model(data)
-                loss = self.criterion(output, data)
-                total_loss += loss.item()
 
-                # Calculate metrics
+                data = batch_to_device(data, self.device)
+                model_output = self.model(data)
+
+                # Handle VAE output (tuple) vs regular output
+                if isinstance(model_output, tuple):
+                    output, _, _ = model_output
+                else:
+                    output = model_output
+
+                loss = self.criterion(model_output, data)
+                total_loss += loss.item()
+                num_batches += 1
+
+                # Log batch metrics with mode='val'
+                self.log_batch_metrics(epoch, batch_idx, loss, data, output, mode='val')
+
+                # Visualizations (every batch for validation since it's infrequent)
+                self.log_visualizations(epoch, batch_idx, data, output, mode='val')
+
+                # Calculate metrics for averaging
                 try:
                     targets = data.get('targets') if isinstance(data, dict) else data.targets
-                    targets = targets[:, :233, :]
                     node_mask = data.get('node_mask') if isinstance(data, dict) else getattr(data, 'node_mask', None)
-                    node_mask = node_mask[:, :233]
-                    output_sliced = output[:, :233, :].exp()
+                    output_sliced = output.exp()
 
                     metrics_dict = self.metrics.calculate_metrics(output_sliced, targets, node_mask)
                     onset_dict = self.onset_metrics(output_sliced, targets, node_mask)
                     metrics_dict.update(onset_dict)
                     all_metrics.append(metrics_dict)
-                    self.log_batch_metrics(0, batch_idx, loss, data, output)
-                    self.log_visualizations(0, batch_idx, data, output, mode='val')
                 except Exception as e:
                     logger.warning(f"Could not calculate validation metrics: {e}")
 
-                
-                
-                    
-
         # Average metrics across all batches
-        avg_loss = total_loss / 10
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
 
         if all_metrics:
             avg_metrics = {}
             for key in all_metrics[0].keys():
                 avg_metrics[key] = sum(m[key] for m in all_metrics) / len(all_metrics)
 
-            # Log validation metrics
-            self.tb_logger.log_scalar('loss/validation', avg_loss, self.global_step)
-            self.tb_logger.log_metrics_dict(avg_metrics, prefix='val_metrics/', step=self.global_step)
+            # Log epoch-level validation summary
+            self.tb_logger.log_scalar('loss/val_epoch', avg_loss, self.global_step)
+            self.tb_logger.log_metrics_dict(avg_metrics, prefix='val_epoch_metrics/', step=self.global_step)
 
             logger.info(
-                f"Validation - Loss: {avg_loss:.4f} | "
+                f"\n{'='*60}\n"
+                f"Validation Summary\n"
+                f"Loss: {avg_loss:.4f} | "
                 f"Acc: {avg_metrics['note_accuracy']:.3f} | "
-                f"F1: {avg_metrics['f1']:.3f}"
+                f"F1: {avg_metrics['f1']:.3f}\n"
+                f"{'='*60}\n"
             )
         else:
             logger.info(f"Validation Loss: {avg_loss:.4f}")
