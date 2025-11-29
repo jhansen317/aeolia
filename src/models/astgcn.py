@@ -37,6 +37,8 @@ from torch_geometric.utils import (
     index_to_mask,
 )
 
+from src.utils.graph_helpers import pool_edge_indices, unpool_graphs
+
 GLOBAL_DROPOUT = 0.5
 DROPOUT_2D= 0.4
 
@@ -648,7 +650,9 @@ class STAttention(nn.Module):
         for t in range(X.shape[-1]):
             x_chunk = X[:, :, :, t]
             att_chunk = X_tilde_out[:, :, :, t:t+self.time_kernel]
-            X_tilde_t = self._spatial_attention(att_chunk, att_chunk)
+
+            # Disable spatial attention - use identity (graph structure encodes relationships)
+            X_tilde_t = torch.eye(num_of_vertices, device=att_chunk.device, dtype=att_chunk.dtype).unsqueeze(0).expand(batch_size, -1, -1)
 
             if use_global_graph:
                 # Process each sample in batch separately with its own mask
@@ -702,185 +706,125 @@ class STAttention(nn.Module):
 
 
 
-class AutoregressiveBottleneck(nn.Module):
+class FiLM(nn.Module):
     """
-    Lightweight autoregressive block for bottleneck processing.
-    Takes encoder output and regenerates it autoregressively during training.
+    Feature-wise Linear Modulation for conditioning decoder on composer.
 
-    During training, this block:
-    1. Receives encoder output [e1, e2, ..., e8]
-    2. Autoregressively generates [o1, o2, ..., o8] by:
-       - Step 1: [e1, e2, ..., e8] -> o1
-       - Step 2: [e1, e2, ..., e7, o1] -> o2
-       - Step 3: [e1, e2, ..., e6, o1, o2] -> o3
-       - etc.
-    3. Returns the full autoregressive sequence
-
-    During inference, passes through encoder output directly for speed.
+    Applies: output = gamma * x + beta
+    where gamma and beta are learned per-composer.
     """
 
-    def __init__(self, channels: int, nodes: int, timesteps: int, time_kernel: int = 3):
-        super(AutoregressiveBottleneck, self).__init__()
+    def __init__(self, num_composers: int, channels: int):
+        super(FiLM, self).__init__()
+        self.gamma = nn.Embedding(num_composers, channels)
+        self.beta = nn.Embedding(num_composers, channels)
+
+        # Initialize gamma to 1, beta to 0 (identity transform initially)
+        nn.init.ones_(self.gamma.weight)
+        nn.init.zeros_(self.beta.weight)
+
+    def forward(self, x: torch.FloatTensor, composer_ids: torch.LongTensor) -> torch.FloatTensor:
+        """
+        Args:
+            x: [batch, nodes, channels, timesteps]
+            composer_ids: [batch] or [batch, 1]
+
+        Returns:
+            modulated: [batch, nodes, channels, timesteps]
+        """
+        # Handle different shapes of composer_ids
+        if composer_ids.dim() > 1:
+            composer_ids = composer_ids.squeeze(-1)
+
+        gamma = self.gamma(composer_ids)  # [batch, channels]
+        beta = self.beta(composer_ids)    # [batch, channels]
+
+        # Broadcast: [batch, 1, channels, 1] to match x
+        gamma = gamma.unsqueeze(1).unsqueeze(-1)
+        beta = beta.unsqueeze(1).unsqueeze(-1)
+
+        return gamma * x + beta
+
+
+class VAEBottleneck(nn.Module):
+    """
+    Variational bottleneck for learning latent distributions.
+
+    Encodes input to mu and logvar, samples z using reparameterization trick,
+    enabling conditional generation with stochasticity.
+    """
+
+    def __init__(self, channels: int, nodes: int, timesteps: int):
+        super(VAEBottleneck, self).__init__()
         self.channels = channels
         self.nodes = nodes
         self.timesteps = timesteps
-        self.time_kernel = time_kernel
 
-        # Temporal attention with causal masking
-        self.temporal_attention = TemporalAttention(
-            q_channels=channels,
-            q_nodes=nodes,
-            q_timesteps=timesteps,
-            causal_mask=True
-        )
-
-        # Feedforward layers
-        self.ff1 = nn.Linear(channels, channels * 4)
-        self.ff2 = nn.Linear(channels * 4, channels)
-
-        # Layer normalization
-        self.layer_norm1 = nn.LayerNorm(channels)
-        self.layer_norm2 = nn.LayerNorm(channels)
-
-        self.dropout = nn.Dropout(GLOBAL_DROPOUT)
+        # Project to mu and logvar
+        self.to_mu = nn.Conv2d(channels, channels, kernel_size=1)
+        self.to_logvar = nn.Conv2d(channels, channels, kernel_size=1)
 
     def forward(
         self,
         encoder_out: torch.FloatTensor,
-        graphs,  # noqa: ARG002 - kept for API consistency
         training: bool = True
-    ) -> torch.FloatTensor:
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """
-        Forward pass with autoregressive generation during training.
-
         Args:
-            encoder_out: [batch, nodes, channels, timesteps] - output from encoder
-            graphs: Graph structure (unused in lightweight version, kept for API consistency)
-            training: If False, skip autoregressive processing (for fast inference)
+            encoder_out: [batch, nodes, channels, timesteps]
+            training: If True, sample from distribution; else use mean
 
         Returns:
-            output: [batch, nodes, channels, timesteps] - autoregressively generated sequence
+            z: sampled latent [batch, nodes, channels, timesteps]
+            mu: mean [batch, nodes, channels, timesteps]
+            logvar: log variance [batch, nodes, channels, timesteps]
         """
-        if not training:
-            # During inference, just pass through for speed
-            return encoder_out
+        # Transpose to [batch, channels, nodes, timesteps] for Conv2d
+        x = encoder_out.permute(0, 2, 1, 3)
 
-        batch_size, num_nodes, num_channels, num_timesteps = encoder_out.shape
+        mu = self.to_mu(x)
+        logvar = self.to_logvar(x)
 
-        # Initialize output tensor
-        output = torch.zeros_like(encoder_out)
+        if training:
+            # Reparameterization trick: z = mu + sigma * epsilon
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            z = mu + eps * std
+        else:
+            # Deterministic at test time
+            z = mu
 
-        # Autoregressive loop: replace encoder outputs from right to left
-        for step in range(num_timesteps):
-            # Build current input: encoder outputs + previous autoregressive outputs
-            current_input = encoder_out.clone()
-            if step > 0:
-                # Replace the last 'step' timesteps with previously generated outputs
-                current_input[:, :, :, -step:] = output[:, :, :, -step:]
+        # Transpose back to [batch, nodes, channels, timesteps]
+        z = z.permute(0, 2, 1, 3)
+        mu = mu.permute(0, 2, 1, 3)
+        logvar = logvar.permute(0, 2, 1, 3)
 
-            # Process through temporal attention
-            # current_input shape: [batch, nodes, channels, timesteps]
-            attn_out = self.temporal_attention(current_input, current_input)
-
-            # Apply attention to input: [batch, nodes*channels, timesteps] @ [batch, timesteps, timesteps]
-            reshaped_input = current_input.reshape(batch_size, -1, num_timesteps)
-            attn_output = torch.matmul(reshaped_input, attn_out.transpose(-1, -2))
-            attn_output = attn_output.reshape(batch_size, num_nodes, num_channels, num_timesteps)
-
-            # Take only the last timestep (the one we're generating)
-            timestep_out = attn_output[:, :, :, -1]  # [batch, nodes, channels]
-
-            # Feedforward network with residual connection
-            # Layer norm -> FF1 -> GELU -> Dropout -> FF2 -> Dropout
-            normalized = self.layer_norm1(timestep_out)
-            ff_out = self.ff1(normalized)
-            ff_out = F.gelu(ff_out)
-            ff_out = self.dropout(ff_out)
-            ff_out = self.ff2(ff_out)
-            ff_out = self.dropout(ff_out)
-
-            # Residual connection + final layer norm
-            timestep_out = self.layer_norm2(timestep_out + ff_out)
-
-            # Store in output at position corresponding to how many we've generated
-            # After step 0: we've generated o1, which goes in position -1 (last)
-            # After step 1: we've generated o2, which goes in position -2 (second to last)
-            # etc.
-            output[:, :, :, -(step + 1)] = timestep_out
-
-        return output
+        return z, mu, logvar
 
     @torch.no_grad()
-    def generate_from_prior(
+    def sample_from_prior(
         self,
         batch_size: int,
         device: torch.device,
-        temperature: float = 1.0,
-        active_nodes_mask: torch.BoolTensor = None
+        temperature: float = 1.0
     ) -> torch.FloatTensor:
         """
-        Generate bottleneck representation from noise (unconditional generation).
+        Sample from N(0, I) prior for unconditional generation.
 
         Args:
-            batch_size: Number of samples to generate
+            batch_size: Number of samples
             device: Device to generate on
-            temperature: Sampling temperature (higher = more random)
-            active_nodes_mask: Optional [batch, nodes] mask indicating which nodes should be active.
-                              If None, uses all nodes with scaled noise.
+            temperature: Sampling temperature (scales variance)
 
         Returns:
-            output: [batch, nodes, channels, timesteps] - generated bottleneck representation
+            z: [batch, nodes, channels, timesteps]
         """
-        # Initialize first timestep from noise
-        # Start with smaller noise and let the model build it up
-        output = torch.randn(
-            batch_size, self.nodes, self.channels, 1,
+        z = torch.randn(
+            batch_size, self.nodes, self.channels, self.timesteps,
             device=device
-        ) * (temperature * 0.1)  # Start with small noise
+        ) * temperature
 
-        # If we have a mask, zero out inactive nodes
-        if active_nodes_mask is not None:
-            output = output * active_nodes_mask.unsqueeze(-1).unsqueeze(-1)
-
-        # Autoregressively generate remaining timesteps
-        for step in range(1, self.timesteps):
-            # Pad output to full timestep size for attention processing
-            # Padding goes at the beginning since we're building up from timestep 0
-            padded_output = F.pad(output, (self.timesteps - step, 0), value=0.0)
-
-            # Process through temporal attention
-            attn_out = self.temporal_attention(padded_output, padded_output)
-
-            # Apply attention
-            reshaped_input = padded_output.reshape(batch_size, -1, self.timesteps)
-            attn_output = torch.matmul(reshaped_input, attn_out.transpose(-1, -2))
-            attn_output = attn_output.reshape(batch_size, self.nodes, self.channels, self.timesteps)
-
-            # Take the last position (where we're generating)
-            timestep_out = attn_output[:, :, :, -1]  # [batch, nodes, channels]
-
-            # Feedforward network
-            normalized = self.layer_norm1(timestep_out)
-            ff_out = self.ff1(normalized)
-            ff_out = F.gelu(ff_out)
-            ff_out = self.ff2(ff_out)
-
-            # Residual connection + layer norm
-            timestep_out = self.layer_norm2(timestep_out + ff_out)
-
-            # Add small amount of noise for diversity (optional, controlled by temperature)
-            if temperature > 0:
-                noise = torch.randn_like(timestep_out) * (temperature * 0.05)
-                timestep_out = timestep_out + noise
-
-            # Apply mask if provided
-            if active_nodes_mask is not None:
-                timestep_out = timestep_out * active_nodes_mask.unsqueeze(-1)
-
-            # Append to output
-            output = torch.cat([output, timestep_out.unsqueeze(-1)], dim=-1)
-
-        return output
+        return z
 
 
 class ASTGCNBlock(nn.Module):
@@ -935,7 +879,9 @@ class ASTGCNBlock(nn.Module):
         cross_timesteps: int,
         temporal_conv: Optional[bool] = False,
         causal_mask: Optional[bool] = False,
-        is_decoder: Optional[bool] = False
+        is_decoder: Optional[bool] = False,
+        num_composers: Optional[int] = None,
+        use_film: Optional[bool] = False
     ):
         super(ASTGCNBlock, self).__init__()
         self.padding = self_time_kernel-1
@@ -943,6 +889,8 @@ class ASTGCNBlock(nn.Module):
         self.self_nodes = self_nodes
         self.out_nodes = out_nodes
         self.self_labels = self_labels
+        self.is_decoder = is_decoder
+        self.use_film = use_film and is_decoder  # Only apply FiLM to decoder blocks
         self.self_space_channels_in = self_space_channels_in
         self.self_space_channels_out = self_space_channels_out
         self.time_kernel = self_time_kernel
@@ -1044,19 +992,27 @@ class ASTGCNBlock(nn.Module):
             )
         self._layer_norm = nn.LayerNorm(self.self_time_channels_out, bias=False)
 
+        # FiLM conditioning for decoder (style injection)
+        if self.use_film and num_composers is not None:
+            self.film = FiLM(num_composers, self.self_time_channels_out)
+        else:
+            self.film = None
+
     def forward(
         self,
         X: torch.FloatTensor,
         input_graphs: List[Data],
         output_graphs: List[Data] = None,
-        pool_first: bool = True
+        pool_first: bool = True,
+        composer_ids: torch.LongTensor = None
     ) -> torch.FloatTensor:
         """
-        Making a forward pass with the ASTGCN block.x
+        Making a forward pass with the ASTGCN block.
 
         Arg types:
             * **X** (PyTorch Float Tensor) - Node features for T time periods, with shape (B, N_nodes, F_in, T_in).
             * **edge_index** (LongTensor): Edge indices, can be an array of a list of Tensor arrays, depending on whether edges change over time.
+            * **composer_ids** (LongTensor, optional): Composer IDs for FiLM conditioning, shape (B,) or (B, 1).
 
         Return types:
             * **X** (PyTorch Float Tensor) - Hidden state tensor for all nodes, with shape (B, N_nodes, nb_time_filter, T_out).
@@ -1116,13 +1072,15 @@ class ASTGCNBlock(nn.Module):
                     )
             X_residual = self._residual_convolution(X_residual)
 
-        #-adding X_residual + X_hat->(32, 64, 307, 12)-permuting-> (32, 12, 307, 64)-layer_normalization-permuting->(32, 307, 64,12)
-
         # ===== COMBINE AND NORMALIZE =====
         X = self._layer_norm(F.gelu(X_residual + X_hat).permute(0, 2, 3, 1))
+        X = X.permute(0, 1, 3, 2)  # Back to (B, N, F, T)
 
-        X = X.permute(0, 1, 3, 2)
-        return X, input_graphs, input_graphs, 0.0 # (b,N,F,T) for example (32, 307, 64,12)
+        # ===== APPLY FiLM CONDITIONING (decoder only) =====
+        if self.film is not None and composer_ids is not None:
+            X = self.film(X, composer_ids)
+
+        return X, input_graphs, input_graphs, 0.0  # (B, N, F, T)
 
 
 
@@ -1189,7 +1147,8 @@ class PolyphonyGCN(torch.nn.Module):
             print(f'in steps: {config.periods_out[i]}')
             print(f'out steps: {config.periods_in[i]}')
             if i == blocknums[-1]:
-                out_nodes = 128
+                # Final decoder output should match encoder input (all content nodes)
+                out_nodes = config.nodes_in[0]  # 233 nodes (pitches + voices + rhythms)
             else:
                 out_nodes = config.nodes_in[i]
             in_nodes = config.nodes_out[i]
@@ -1213,7 +1172,9 @@ class PolyphonyGCN(torch.nn.Module):
                     config.time_kernels[i],
                     temporal_conv=True,
                     causal_mask=True,
-                    is_decoder=True  # Decoder blocks use transposed conv
+                    is_decoder=True,  # Decoder blocks use transposed conv
+                    num_composers=config.num_composers,
+                    use_film=True  # Enable FiLM conditioning in decoder
                 )
             )
 
@@ -1221,22 +1182,20 @@ class PolyphonyGCN(torch.nn.Module):
             decblocks
         )
 
-        # Autoregressive bottleneck block (optional)
-        self.use_autoregressive_bottleneck = getattr(config, 'use_autoregressive_bottleneck', False)
-        if self.use_autoregressive_bottleneck:
+        # VAE bottleneck for latent variable modeling
+        self.use_vae = getattr(config, 'use_vae', True)
+        if self.use_vae:
             # Bottleneck operates on the smallest compressed representation
-            bottleneck_timesteps = min(config.periods_out)  # Should be 8
-            bottleneck_nodes = config.nodes_out[-1]  # Nodes at the bottleneck (smallest encoder output)
+            bottleneck_timesteps = min(config.periods_out)
+            bottleneck_nodes = config.nodes_out[-1]
             bottleneck_channels = config.input_dim
-            bottleneck_time_kernel = config.time_kernels[-1]  # Use same kernel as last encoder block
 
-            self.autoregressive_bottleneck = AutoregressiveBottleneck(
+            self.vae_bottleneck = VAEBottleneck(
                 channels=bottleneck_channels,
                 nodes=bottleneck_nodes,
-                timesteps=bottleneck_timesteps,
-                time_kernel=bottleneck_time_kernel
+                timesteps=bottleneck_timesteps
             )
-            print(f"Initialized autoregressive bottleneck: {bottleneck_timesteps} timesteps, "
+            print(f"Initialized VAE bottleneck: {bottleneck_timesteps} timesteps, "
                   f"{bottleneck_nodes} nodes, {bottleneck_channels} channels")
 
         min_seq = min(config.periods_out)
@@ -1279,44 +1238,6 @@ class PolyphonyGCN(torch.nn.Module):
         self.config = config
 
 
-    def apply_voice_dropout(self, x, training=True):
-        """
-        Apply voice-level dropout during training.
-
-        Masks entire voice nodes across all timesteps by zeroing their features.
-        This forces the model to learn harmonization by predicting masked voices
-        from other voices, pitches, rhythms, and composer context.
-
-        Args:
-            x: Input features [batch, num_nodes, input_dim, timesteps]
-            training: Whether in training mode
-
-        Returns:
-            x with voice nodes randomly masked, voice_mask indicating which voices were kept
-        """
-        if not training or self.config.voice_dropout_rate == 0.0:
-            return x, None
-
-        batch_size = x.shape[0]
-        device = x.device
-
-        # Voice node indices
-        voice_start = self.config.num_pitches
-        voice_end = voice_start + self.config.num_voices
-
-        # Create dropout mask: [batch, num_voices]
-        # Each voice independently has (1 - dropout_rate) probability of being kept
-        voice_mask = torch.rand(batch_size, self.config.num_voices, device=device) > self.config.voice_dropout_rate
-
-        # Expand mask to match x shape: [batch, num_voices] -> [batch, num_voices, input_dim, timesteps]
-        voice_mask_expanded = voice_mask.unsqueeze(-1).unsqueeze(-1).expand(
-            batch_size, self.config.num_voices, x.shape[2], x.shape[3]
-        )
-
-        # Apply mask to voice nodes only
-        x[:, voice_start:voice_end, :, :] = x[:, voice_start:voice_end, :, :] * voice_mask_expanded.float()
-
-        return x, voice_mask
 
     @torch.no_grad()
     def make_positional_sinusoids(self):
@@ -1418,7 +1339,7 @@ class PolyphonyGCN(torch.nn.Module):
 
     def forward(self, databatch):
         """
-        Forward pass using simplified graph structure.
+        Forward pass with VAE bottleneck and FiLM-conditioned decoder.
 
         Args:
             databatch: Dictionary containing:
@@ -1426,15 +1347,46 @@ class PolyphonyGCN(torch.nn.Module):
                 - 'feature_indices': Feature indices for embedding lookup
                 - 'input_graphs': List of batched graphs per timestep
                 - 'target_graphs': List of batched target graphs per timestep
-                - 'global_graph': Union of all timesteps' graphs (optional, used if config.use_global_graph=True)
+                - 'global_graph': Union of all timesteps' graphs
+                - 'composer_id': Composer IDs for conditioning [batch] or [batch, 1]
+
+        Returns:
+            If training with VAE:
+                (output, mu, logvar) tuple
+            Otherwise:
+                output tensor
         """
         x = databatch['features']
         x_indices = databatch['feature_indices']
+        composer_ids = databatch['composer_id']
+
+        # Handle composer_ids shape: convert list of tensors to single tensor
+        if isinstance(composer_ids, list):
+            composer_ids = torch.cat(composer_ids, dim=0)
+        if composer_ids.dim() > 1:
+            composer_ids = composer_ids.squeeze(-1)
+
         x_emb = self.get_inputs(x_indices)
         x = x.unsqueeze(-2) * x_emb
 
-        # Apply voice dropout during training (for harmonization learning)
-        x, voice_mask = self.apply_voice_dropout(x, training=self.training)
+        # Apply simple node dropout to pitch nodes (0-127) only during training
+        if self.training and hasattr(self.config, 'voice_dropout_rate') and self.config.voice_dropout_rate > 0.0:
+            node_mask = databatch['node_mask']  # [batch, num_nodes]
+
+            # Create dropout probability tensor: zeros everywhere
+            node_drop_probs = torch.zeros_like(node_mask, dtype=torch.float32)
+
+            # Set dropout probability only for nodes 0-127 that have features
+            pitch_mask = node_mask.clone()
+            pitch_mask[:, 128:] = False  # Only keep pitch nodes (0-127)
+            node_drop_probs = torch.where(pitch_mask, self.config.voice_dropout_rate, node_drop_probs)
+
+            # Sample Bernoulli to get dropout mask
+            node_2d_dropout_mask = torch.bernoulli(node_drop_probs).bool()  # [batch, num_nodes]
+
+            # Zero out features for dropped nodes (across all timesteps and channels)
+            # x shape: [batch, num_nodes, channels, timesteps]
+            x[node_2d_dropout_mask] = 0.0
 
         # Use config setting for graph structure
         use_global = getattr(self.config, 'use_global_graph', True)
@@ -1449,26 +1401,46 @@ class PolyphonyGCN(torch.nn.Module):
             input_graphs = databatch['input_graphs']
             target_graphs = databatch['target_graphs']
 
-        # Encoder pass
+        # Encoder pass (content-only, no composer conditioning)
         current_graphs = input_graphs
         for i in range(self.config.num_blocks):
             x, _, current_graphs, _ = self.encoder[i](x, current_graphs, current_graphs, pool_first=False)
             x = F.dropout(x, GLOBAL_DROPOUT, self.training)
 
-        # Autoregressive bottleneck (if enabled)
-        if self.use_autoregressive_bottleneck:
-            x = self.autoregressive_bottleneck(x, current_graphs, training=self.training)
+            # Pool graphs to match temporal downsampling
+            if isinstance(current_graphs, list) and i < self.config.num_blocks - 1:
+                target_length = self.config.periods_out[i]
+                current_graphs = pool_edge_indices(current_graphs, target_length, reduce='mean')
 
-        # Decoder pass
+        # VAE bottleneck: sample from latent distribution
+        mu, logvar = None, None
+        if self.use_vae:
+            x, mu, logvar = self.vae_bottleneck(x, training=self.training)
+
+        # Decoder pass (composer-conditioned via FiLM)
         current_graphs = target_graphs if self.training else current_graphs
         for i in range(self.config.num_blocks):
-            x, _, current_graphs, _ = self.decoder[i](x, current_graphs, current_graphs, pool_first=False)
+            x, _, current_graphs, _ = self.decoder[i](
+                x, current_graphs, current_graphs,
+                pool_first=False,
+                composer_ids=composer_ids  # Pass composer for FiLM conditioning
+            )
+
+            # Unpool graphs to match temporal upsampling
+            if isinstance(current_graphs, list) and i < self.config.num_blocks - 1:
+                target_length = self.config.periods_in[self.config.num_blocks - i - 2]
+                current_graphs = unpool_graphs(current_graphs, target_length)
 
         # Final convolution and output
-        x = self._final_conv(x[:,:-1, :, :].permute(0, 3, 1, 2))
+        # Note: No longer need to exclude composer node (already removed from graph)
+        x = self._final_conv(x.permute(0, 3, 1, 2))
         x = x[:, :, :, -1]
         x = x.permute(0, 2, 1)
         x = F.log_softmax(x, dim=-2)
+
+        # Return mu, logvar for KL loss during training
+        if self.training and self.use_vae:
+            return x, mu, logvar
         return x
 
     def predict(self, databatch):
